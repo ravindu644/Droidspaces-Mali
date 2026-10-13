@@ -1,0 +1,122 @@
+From 78024524542baa489c49948fe052bcecfc102178 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:46:02 +0530
+Subject: [PATCH 3/5] kopper: add LIBGL_KOPPER_DISABLE_X11, an X11-only kopper
+ switch
+
+Zink presents through kopper, which needs the Vulkan driver's X11 surface
+(VK_KHR_xcb_surface). A Vulkan driver reached through libhybris (the Mali blob)
+has Wayland and Android surfaces only, so GLX and EGL on X11 crash in kopper,
+while LIBGL_KOPPER_DISABLE also takes kopper away from Wayland EGL, which then
+fails. LIBGL_KOPPER_DISABLE_X11 sends only X11 clients to the DRI3 loader path.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ src/egl/drivers/dri2/egl_dri2.c     |  4 +++-
+ src/egl/drivers/dri2/platform_x11.c |  3 ++-
+ src/glx/dri3_glx.c                  |  2 +-
+ src/glx/drisw_glx.c                 |  2 +-
+ src/glx/glxclient.h                 | 11 +++++++++++
+ src/glx/glxext.c                    |  4 ++--
+ 6 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index e813aa6..c195225 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -590,7 +590,9 @@ dri2_load_driver(_EGLDisplay *disp)
+ {
+    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+ 
+-   dri2_dpy->kopper = disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
++   bool x11 = disp->Platform == _EGL_PLATFORM_X11 || disp->Platform == _EGL_PLATFORM_XCB;
++   dri2_dpy->kopper = disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false) &&
++                      !(x11 && debug_get_bool_option("LIBGL_KOPPER_DISABLE_X11", false));
+    dri2_dpy->kopper_without_modifiers = dri2_dpy->kopper && debug_get_bool_option("LIBGL_KOPPER_DRI2", false);
+    dri2_dpy->swrast = (disp->Options.ForceSoftware && !dri2_dpy->kopper && strcmp(dri2_dpy->driver_name, "vmwgfx")) ||
+                       !dri2_dpy->driver_name || strstr(dri2_dpy->driver_name, "swrast");
+diff --git a/src/egl/drivers/dri2/platform_x11.c b/src/egl/drivers/dri2/platform_x11.c
+index be0c998..f7a0979 100644
+--- a/src/egl/drivers/dri2/platform_x11.c
++++ b/src/egl/drivers/dri2/platform_x11.c
+@@ -2087,7 +2087,8 @@ dri2_initialize_x11(_EGLDisplay *disp)
+ {
+    enum dri2_egl_driver_fail status = DRI2_EGL_DRIVER_FAILED;
+    if (disp->Options.ForceSoftware ||
+-       (disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false)))
++       (disp->Options.Zink && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false) &&
++        !debug_get_bool_option("LIBGL_KOPPER_DISABLE_X11", false)))
+       return dri2_initialize_x11_swrast(disp);
+ 
+ #ifdef HAVE_LIBDRM
+diff --git a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
+index dc4eb84..c730d67 100644
+--- a/src/glx/dri3_glx.c
++++ b/src/glx/dri3_glx.c
+@@ -526,7 +526,7 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
+    }
+    psc->base.driverName = driverName;
+ 
+-   if (!strcmp(driverName, "zink") && !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false)) {
++   if (!strcmp(driverName, "zink") && !glx_kopper_disabled()) {
+       *return_zink = true;
+       goto handle_error;
+    }
+diff --git a/src/glx/drisw_glx.c b/src/glx/drisw_glx.c
+index 26f7569..f864bd9 100644
+--- a/src/glx/drisw_glx.c
++++ b/src/glx/drisw_glx.c
+@@ -625,7 +625,7 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
+    __GLXDRIscreen *psp;
+    struct drisw_screen *psc;
+    const __DRIextension **loader_extensions_local;
+-   bool kopper_disable = debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
++   bool kopper_disable = glx_kopper_disabled();
+ 
+    /* this is only relevant if zink bits are set */
+    glx_driver &= (GLX_DRIVER_ZINK_INFER | GLX_DRIVER_ZINK_YES);
+diff --git a/src/glx/glxclient.h b/src/glx/glxclient.h
+index 97c5bc0..3af85f6 100644
+--- a/src/glx/glxclient.h
++++ b/src/glx/glxclient.h
+@@ -804,4 +804,15 @@ extern int __glXGetDrawableAttribute(Display * dpy, GLXDrawable drawable,
+ }
+ #endif
+ 
++#include "util/u_debug.h"
++
++/* LIBGL_KOPPER_DISABLE, or LIBGL_KOPPER_DISABLE_X11 for drivers whose Vulkan has no X11
++ * surface: zink then presents through the DRI3 loader, while EGL on Wayland keeps kopper. */
++static inline bool
++glx_kopper_disabled(void)
++{
++   return debug_get_bool_option("LIBGL_KOPPER_DISABLE", false) ||
++          debug_get_bool_option("LIBGL_KOPPER_DISABLE_X11", false);
++}
++
+ #endif /* !__GLX_client_h__ */
+diff --git a/src/glx/glxext.c b/src/glx/glxext.c
+index f56b530..3fdc474 100644
+--- a/src/glx/glxext.c
++++ b/src/glx/glxext.c
+@@ -996,7 +996,7 @@ __glXInitialize(Display * dpy)
+    Bool glx_direct = !debug_get_bool_option("LIBGL_ALWAYS_INDIRECT", false);
+    Bool glx_accel = !debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false);
+    Bool dri3 = !debug_get_bool_option("LIBGL_DRI3_DISABLE", false);
+-   Bool kopper = !debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
++   Bool kopper = !glx_kopper_disabled();
+ 
+    if (env && !strcmp(env, "zink"))
+       glx_driver |= GLX_DRIVER_ZINK_YES;
+@@ -1024,7 +1024,7 @@ __glXInitialize(Display * dpy)
+          if (!dri3_err) {
+             glx_driver |= GLX_DRIVER_DRI3;
+             /* nouveau wants to fallback to zink so if we get a screen enable try_zink */
+-            if (!debug_get_bool_option("LIBGL_KOPPER_DISABLE", false))
++            if (!glx_kopper_disabled())
+                glx_driver |= GLX_DRIVER_ZINK_INFER;
+          }
+       }
+-- 
+2.55.0
+

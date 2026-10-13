@@ -1,0 +1,56 @@
+From 2893b01bd53f9cf7237532353fa630c05532457e Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:27 +0530
+Subject: [PATCH 10/22] hybris: vulkan: let the client choose the surface
+ extent
+
+The Android WSI reports the placeholder window's 1x1 size as the fixed
+current extent, so every swapchain was 1x1. Report 0xFFFFFFFF, as Wayland
+surfaces do.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/vulkan/vulkan.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 3648550..10502ba 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -139,6 +139,8 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+         return (PFN_vkVoidFunction)vkCreateInstance;
+     } else if (!strcmp(pName, "vkGetInstanceProcAddr")) {
+         return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
++    } else if (!strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) {
++        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+ #ifdef WANT_WAYLAND
+     } else if (!strcmp(pName, "vkCreateWaylandSurfaceKHR")) {
+         return (PFN_vkVoidFunction)vkCreateWaylandSurfaceKHR;
+@@ -359,7 +361,23 @@ VULKAN_IDLOAD(vkGetDeviceImageMemoryRequirements);
+ VULKAN_IDLOAD(vkGetDeviceImageSparseMemoryRequirements);
+ #endif
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceSupportKHR);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
++/* The Wayland platform creates every window at a 1x1 placeholder, and Android's
++ * WSI reports the window's size as the surface's fixed currentExtent, so clients
++ * built 1x1 swapchains that compositors then left unmapped. On Wayland the client
++ * picks the size: report the "any size" extent, and the swapchain's size reaches
++ * the window through native_window_set_buffers_dimensions(). */
++VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *caps)
++{
++    static PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real;
++    VkResult ret;
++
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)_android_vulkan_dlsym("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
++    ret = real(physicalDevice, surface, caps);
++    if (ret == VK_SUCCESS && caps->currentExtent.width == 1 && caps->currentExtent.height == 1)
++        caps->currentExtent.width = caps->currentExtent.height = 0xFFFFFFFF;
++    return ret;
++}
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceFormatsKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfacePresentModesKHR);
+ VULKAN_IDLOAD(vkCreateSwapchainKHR);
+-- 
+2.55.0
+

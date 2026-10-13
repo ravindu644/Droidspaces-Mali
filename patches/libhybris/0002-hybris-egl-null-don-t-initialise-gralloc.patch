@@ -1,0 +1,31 @@
+From 6eaecd1647ef4b7fe79c7b0b9b447e71e3af8478 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:26 +0530
+Subject: [PATCH 02/22] hybris: egl: null: don't initialise gralloc
+
+The null platform backs no windows, so it never needs gralloc. On devices
+whose only gralloc is the gralloc4 HIDL service there is no legacy gralloc
+module, and the initialisation asserted before any EGL call could succeed.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/egl/platforms/null/eglplatform_null.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/hybris/egl/platforms/null/eglplatform_null.c b/hybris/egl/platforms/null/eglplatform_null.c
+index b7d3327..f8f859e 100644
+--- a/hybris/egl/platforms/null/eglplatform_null.c
++++ b/hybris/egl/platforms/null/eglplatform_null.c
+@@ -34,7 +34,8 @@ static HYBRIS_IMPLEMENT_FUNCTION0(nullui, EGLNativeWindowType, android_createDis
+ 
+ static void nullws_init_module(struct ws_egl_interface *egl_iface)
+ {
+-        hybris_gralloc_initialize(0);
++	/* null has no windows to back, and devices with only gralloc4 HIDL have no
++	 * legacy module to open, so leave gralloc to the window platforms */
+ 	eglplatformcommon_init(egl_iface);
+ }
+ 
+-- 
+2.55.0
+

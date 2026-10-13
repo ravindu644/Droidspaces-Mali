@@ -1,0 +1,44 @@
+From 2f36f27f8f0eaee224c00dac477a9a3cc78a5956 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:26 +0530
+Subject: [PATCH 07/22] hybris: wayland_window_common: bind linux-dmabuf before
+ the first buffers
+
+setBufferCount() creates DrmWaylandBuffers that copy wl_dmabuf, and it ran
+before the registry was scanned, so the first present used an uninitialised
+pointer.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/platforms/wayland/wayland_window_common.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index 7cb96ed..9151b0e 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -217,15 +217,18 @@ WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window,
+     m_freeBufs = 0;
+     m_damage_rects = NULL;
+     m_damage_n_rects = 0;
+-    WaylandNativeWindow::setBufferCount(3);
+ #ifdef WANT_LINDROID_DRM
+-    if(!m_android_wlegl) {
+-        if (!display) return;
++    /* Bind linux-dmabuf before the first buffers exist: setBufferCount() creates
++     * DrmWaylandBuffers that copy wl_dmabuf, and an unbound (uninitialised) pointer
++     * crashed the first present. */
++    this->wl_dmabuf = nullptr;
++    if(!m_android_wlegl && display) {
+         struct wl_registry *registry = wl_display_get_registry(display);
+         wl_registry_add_listener(registry, &registry_listener, &this->wl_dmabuf);
+         wl_display_roundtrip(display);
+     }
+ #endif // WANT_LINDROID_DRM
++    WaylandNativeWindow::setBufferCount(3);
+     HYBRIS_TRACE_END("wayland-platform", "create_window", "");
+ }
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,63 @@
+From 8d3e4a291d7d2012e9c08c6dd8645ac90070dc08 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:27 +0530
+Subject: [PATCH 09/22] hybris: egl: ask the driver for dma-buf formats and
+ modifiers
+
+eglQueryDmaBufFormatsEXT and ...ModifiersEXT only asked the window system.
+KWin's import table came out empty, so it rejected every client buffer
+("importing the supplied dmabufs failed"). Fall through to the driver, which
+implements both on Mali.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/egl/egl.c | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/hybris/egl/egl.c b/hybris/egl/egl.c
+index 2d21317..2f70556 100644
+--- a/hybris/egl/egl.c
++++ b/hybris/egl/egl.c
+@@ -600,15 +600,36 @@ EGLDisplay eglGetCurrentDisplay(void)
+ 	return (*_eglGetCurrentDisplay)();
+ }
+ 
++/* Android's own libEGL never offers these, but a vendor driver loaded directly
++ * (LIBEGL=libGLES_mali.so) may. Compositors such as KWin only accept linux-dmabuf
++ * client buffers whose format and modifier these queries report, so an empty answer
++ * rejects every client. Ask the window system first, then the driver. */
++static void *driver_proc(const char *name)
++{
++	HYBRIS_DLSYSM(egl, &_eglGetProcAddress, "eglGetProcAddress");
++	return _eglGetProcAddress ? (void *)(*_eglGetProcAddress)(name) : NULL;
++}
++
+ EGLBoolean eglQueryDmaBufFormatsEXT(EGLDisplay dpy, EGLint max_formats, EGLint *formats, EGLint *num_formats)
+ {
+-	// Underlying android EGL NEVER provides this functionaltiy, so its upo to the ws
+-	return ws_queryDmaBufFormatsEXT(dpy, max_formats, formats, num_formats);
++	static PFNEGLQUERYDMABUFFORMATSEXTPROC real;
++
++	if (ws_queryDmaBufFormatsEXT(dpy, max_formats, formats, num_formats))
++		return EGL_TRUE;
++	if (!real)
++		real = (PFNEGLQUERYDMABUFFORMATSEXTPROC)driver_proc("eglQueryDmaBufFormatsEXT");
++	return real ? real(hybris_egl_get_real_display(dpy), max_formats, formats, num_formats) : EGL_FALSE;
+ }
+ 
+ EGLBoolean eglQueryDmaBufModifiersEXT(EGLDisplay dpy, EGLint format, EGLint max_modifiers, EGLuint64KHR *modifiers, EGLBoolean *external_only, EGLint *num_modifiers)
+ {
+-	return ws_queryDmaBufModifiersEXT(dpy, format, max_modifiers, modifiers, external_only, num_modifiers);
++	static PFNEGLQUERYDMABUFMODIFIERSEXTPROC real;
++
++	if (ws_queryDmaBufModifiersEXT(dpy, format, max_modifiers, modifiers, external_only, num_modifiers))
++		return EGL_TRUE;
++	if (!real)
++		real = (PFNEGLQUERYDMABUFMODIFIERSEXTPROC)driver_proc("eglQueryDmaBufModifiersEXT");
++	return real ? real(hybris_egl_get_real_display(dpy), format, max_modifiers, modifiers, external_only, num_modifiers) : EGL_FALSE;
+ }
+ 
+ EGLBoolean _my_eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, EGLint *rects, EGLint n_rects)
+-- 
+2.55.0
+

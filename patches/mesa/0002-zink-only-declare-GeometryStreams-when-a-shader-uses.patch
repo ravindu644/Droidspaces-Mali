@@ -1,0 +1,69 @@
+From a86c6f3bdda3e6bac94c50fa24fd6c36e8820ff1 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:46:02 +0530
+Subject: [PATCH 2/5] zink: only declare GeometryStreams when a shader uses
+ more than stream 0
+
+nir_to_spirv declared SpvCapabilityGeometryStreams for every geometry shader
+with any active stream, which includes the single stream 0 of the passthrough
+and quad-emulation shaders zink generates itself (GL_QUADS, GL_QUAD_STRIP).
+Drivers without the geometryStreams feature may reject that or, like the Mali
+proprietary driver, crash in vkCreateGraphicsPipelines (glxgears). Declare it
+where upstream does: when a stream vertex or primitive is emitted, and with
+the Stream decoration on outputs of a non-zero stream.
+
+Origin: backport, upstream main (src/gallium/drivers/zink/nir_to_spirv/)
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c  | 2 --
+ src/gallium/drivers/zink/nir_to_spirv/spirv_builder.c | 7 +++++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+index a838cdd..934b4fc 100644
+--- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -4458,8 +4458,6 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
+ 
+    case MESA_SHADER_GEOMETRY:
+       spirv_builder_emit_cap(&ctx.builder, SpvCapabilityGeometry);
+-      if (s->info.gs.active_stream_mask)
+-         spirv_builder_emit_cap(&ctx.builder, SpvCapabilityGeometryStreams);
+       if (s->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ))
+          spirv_builder_emit_cap(&ctx.builder, SpvCapabilityGeometryPointSize);
+       break;
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/spirv_builder.c b/src/gallium/drivers/zink/nir_to_spirv/spirv_builder.c
+index 515d659..aa25c24 100644
+--- a/src/gallium/drivers/zink/nir_to_spirv/spirv_builder.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/spirv_builder.c
+@@ -281,6 +281,7 @@ spirv_builder_emit_vertex(struct spirv_builder *b, uint32_t stream, bool multist
+    unsigned words = 1;
+    SpvOp op = SpvOpEmitVertex;
+    if (multistream) {
++      spirv_builder_emit_cap(b, SpvCapabilityGeometryStreams);
+       op = SpvOpEmitStreamVertex;
+       words++;
+    }
+@@ -295,6 +296,10 @@ spirv_builder_end_primitive(struct spirv_builder *b, uint32_t stream, bool multi
+ {
+    unsigned words = 1;
+    SpvOp op = SpvOpEndPrimitive;
++
++   if (multistream)
++      spirv_builder_emit_cap(b, SpvCapabilityGeometryStreams);
++
+    if (multistream || stream > 0) {
+       op = SpvOpEndStreamPrimitive;
+       words++;
+@@ -365,6 +370,8 @@ void
+ spirv_builder_emit_stream(struct spirv_builder *b, SpvId target, int stream)
+ {
+    uint32_t args[] = { stream };
++   /* the Stream decoration needs it; callers only decorate non-zero streams */
++   spirv_builder_emit_cap(b, SpvCapabilityGeometryStreams);
+    emit_decoration(b, target, SpvDecorationStream, args, ARRAY_SIZE(args));
+ }
+ 
+-- 
+2.55.0
+

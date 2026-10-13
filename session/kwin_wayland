@@ -1,0 +1,16 @@
+#!/bin/sh
+# kwin_wayland_wrapper starts kwin_wayland through PATH, and /opt/hy/bin comes first. KWin
+# runs on the Mali blob's own EGL through libhybris, not on the session's zink setup.
+#
+# Debian ships /usr/bin/kwin_wayland with cap_sys_nice=ep, and file capabilities make
+# glibc ignore LD_LIBRARY_PATH and LD_PRELOAD. So run the copy without them that
+# plasma-mali@.service keeps in /opt/hy/libexec. It must still be named kwin_wayland, or
+# KWin's own QPA plugin refuses to load.
+unset MESA_LOADER_DRIVER_OVERRIDE HYBRIS_VK_DRM_NODE HYBRIS_VK_HIDE_EXTS HYBRIS_VK_HIDE_FEATURES
+export LD_LIBRARY_PATH=/opt/hy/inst/lib HYBRIS_PATCH_TLS=1 KWIN_COMPOSE=O2ES
+export LIBEGL=/vendor/lib64/egl/libGLES_mali.so LIBGLESV2=/vendor/lib64/egl/libGLES_mali.so
+# libdrm skips vgem (a platform device without a device tree node), so name it
+export ANLAND_DRM_DEVICE=/dev/dri/renderD128
+# Children (Xwayland, the lock screen) get mali-gpu.env back at exec
+export LD_PRELOAD=/opt/hy/bin/scrubenv.so
+exec /opt/hy/libexec/kwin_wayland "$@"

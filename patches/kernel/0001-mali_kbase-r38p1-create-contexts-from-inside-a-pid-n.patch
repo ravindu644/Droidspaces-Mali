@@ -1,0 +1,116 @@
+From 8fc369499c2a7721298a82514a92eefbc3d3abe8 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Tue, 13 Oct 2026 15:24:09 +0530
+Subject: [PATCH 1/2] mali_kbase: r38p1: create contexts from inside a pid
+ namespace
+
+kbase_context_common_init() looked the caller up with
+find_get_pid(kctx->tgid). The tgid is the init namespace number, but
+find_get_pid() resolves it in the caller's own pid namespace, so from
+inside a container (Droidspaces, LXC, Docker) the lookup fails, dmesg
+says "Failed to get pid pointer", and KBASE_IOCTL_SET_FLAGS returns
+ENOMEM. Mali GPU access was impossible from any pid-namespaced process.
+
+The lookup only wanted the caller's thread group leader, which is
+current->group_leader. Take the reference on that directly; there is
+no failure path left.
+
+The OOM notifier had the same lookup by kctx->pid and would name the
+wrong task (or none) when the OOM killer runs in another namespace. It
+now prints from kctx->task, which the context holds for its lifetime.
+
+Only mali_kbase_mt6835.ko changes. Nothing imports its symbols, so the
+stock vendor_dlkm modules around it stay as they are, and the module can
+be hot swapped (stop; rmmod; insmod; start) without touching any
+partition: with the framework stopped its refcount drops to 0.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../arm/midgard/context/mali_kbase_context.c  | 38 ++++---------------
+ .../arm/midgard/device/mali_kbase_device.c    | 14 +++----
+ 2 files changed, 12 insertions(+), 40 deletions(-)
+
+diff --git a/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c b/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+index 381112c53..cf8adbf5e 100644
+--- a/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c
++++ b/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+@@ -157,37 +157,13 @@ int kbase_context_common_init(struct kbase_context *kctx)
+ 
+ 	/* Check if this is a Userspace created context */
+ 	if (likely(kctx->kfile)) {
+-		struct pid *pid_struct;
+-
+-		rcu_read_lock();
+-		pid_struct = find_get_pid(kctx->tgid);
+-		if (likely(pid_struct)) {
+-			struct task_struct *task = pid_task(pid_struct, PIDTYPE_PID);
+-
+-			if (likely(task)) {
+-				/* Take a reference on the task to avoid slow lookup
+-				 * later on from the page allocation loop.
+-				 */
+-				get_task_struct(task);
+-				kctx->task = task;
+-			} else {
+-				dev_err(kctx->kbdev->dev,
+-					"Failed to get task pointer for %s/%d",
+-					current->comm, current->pid);
+-				err = -ESRCH;
+-			}
+-
+-			put_pid(pid_struct);
+-		} else {
+-			dev_err(kctx->kbdev->dev,
+-				"Failed to get pid pointer for %s/%d",
+-				current->comm, current->pid);
+-			err = -ESRCH;
+-		}
+-		rcu_read_unlock();
+-
+-		if (unlikely(err))
+-			return err;
++		/* kctx->tgid is the init namespace number, so find_get_pid() on it
++		 * resolves in the caller's pid namespace and fails inside a container.
++		 * The thread group leader is the task that lookup was after. Take a
++		 * reference to avoid slow lookup later on from the page allocation loop.
++		 */
++		kctx->task = current->group_leader;
++		get_task_struct(kctx->task);
+ 
+ 		/* This merely takes a reference on the mm_struct and not on the
+ 		 * address space and so won't block the freeing of address space
+diff --git a/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c b/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c
+index 27f09a39e..adec2c219 100644
+--- a/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c
++++ b/vendor/mediatek/kernel_modules/gpu/gpu_mali/mali_valhall/mali-r38p1/drivers/gpu/arm/midgard/device/mali_kbase_device.c
+@@ -194,22 +194,18 @@ static int mali_oom_notifier_handler(struct notifier_block *nb,
+ 	mutex_lock(&kbdev->kctx_list_lock);
+ 
+ 	list_for_each_entry(kctx, &kbdev->kctx_list, kctx_list_link) {
+-		struct pid *pid_struct;
+-		struct task_struct *task;
++		/* kctx->task is held for the context's lifetime; looking kctx->pid up
++		 * by number would resolve it in whatever pid namespace the OOM killer
++		 * runs in and name the wrong task.
++		 */
++		struct task_struct *task = kctx->task;
+ 		unsigned long task_alloc_total =
+ 			KBASE_PAGES_TO_KIB(atomic_read(&(kctx->used_pages)));
+ 
+-		rcu_read_lock();
+-		pid_struct = find_get_pid(kctx->pid);
+-		task = pid_task(pid_struct, PIDTYPE_PID);
+-
+ 		dev_err(kbdev->dev,
+ 			"OOM notifier: tsk %s  tgid (%u)  pid (%u) %lu kB\n",
+ 			task ? task->comm : "[null task]", kctx->tgid,
+ 			kctx->pid, task_alloc_total);
+-
+-		put_pid(pid_struct);
+-		rcu_read_unlock();
+ 	}
+ 
+ 	mutex_unlock(&kbdev->kctx_list_lock);
+-- 
+2.55.0
+

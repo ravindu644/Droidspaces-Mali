@@ -1,0 +1,67 @@
+From 1648448c6f319165fe728f13b93cecdc70ea0dcd Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:46:03 +0530
+Subject: [PATCH 5/5] zink: advertise instance divisors without
+ VK_EXT_vertex_attribute_divisor
+
+ARB_instanced_arrays depended on the divisor extension, which the Mali
+proprietary Vulkan driver lacks, and GLES 3.0 depends on ARB_instanced_arrays,
+so zink on that driver stopped at GLES 2.0. The per-instance input rate is
+divisor 1 in core Vulkan; use it alone and clamp larger divisors to 1 with
+a warning.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ src/gallium/drivers/zink/zink_screen.c |  7 +++++--
+ src/gallium/drivers/zink/zink_state.c  | 17 +++++++++++++----
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 1304b56..2fd2495 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -901,8 +901,11 @@ zink_init_screen_caps(struct zink_screen *screen)
+       (screen->info.have_vulkan12 && screen->info.feats11.shaderDrawParameters) ||
+       screen->info.have_KHR_shader_draw_parameters;
+ 
+-   caps->vertex_element_instance_divisor =
+-      screen->info.have_EXT_vertex_attribute_divisor;
++   /* Without VK_EXT_vertex_attribute_divisor the binding's instance input rate still gives
++    * divisor 1, which is what nearly every GL/GLES instancing user asks for, and GLES 3.0
++    * depends on ARB_instanced_arrays. Larger divisors are clamped to 1 (zink_state.c).
++    * ponytail: emulate divisors > 1 in the vertex shader if an app ever needs them. */
++   caps->vertex_element_instance_divisor = true;
+ 
+    caps->max_vertex_streams = screen->info.tf_props.maxTransformFeedbackStreams;
+ 
+diff --git a/src/gallium/drivers/zink/zink_state.c b/src/gallium/drivers/zink/zink_state.c
+index 82b1fbf..3c7ea70 100644
+--- a/src/gallium/drivers/zink/zink_state.c
++++ b/src/gallium/drivers/zink/zink_state.c
+@@ -71,10 +71,19 @@ zink_create_vertex_elements_state(struct pipe_context *pctx,
+       ves->bindings[binding].binding = binding;
+       ves->bindings[binding].inputRate = elem->instance_divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+ 
+-      assert(!elem->instance_divisor || zink_screen(pctx->screen)->info.have_EXT_vertex_attribute_divisor);
+-      if (elem->instance_divisor > screen->info.vdiv_props.maxVertexAttribDivisor)
+-         debug_printf("zink: clamping instance divisor %u to %u\n", elem->instance_divisor, screen->info.vdiv_props.maxVertexAttribDivisor);
+-      ves->divisor[binding] = MIN2(elem->instance_divisor, screen->info.vdiv_props.maxVertexAttribDivisor);
++      if (!screen->info.have_EXT_vertex_attribute_divisor) {
++         /* the instance input rate alone is divisor 1; no divisor state to chain */
++         static bool warned;
++         if (elem->instance_divisor > 1 && !warned) {
++            mesa_logw("zink: instance divisor %u treated as 1, the driver has no VK_EXT_vertex_attribute_divisor", elem->instance_divisor);
++            warned = true;
++         }
++         ves->divisor[binding] = 0;
++      } else {
++         if (elem->instance_divisor > screen->info.vdiv_props.maxVertexAttribDivisor)
++            debug_printf("zink: clamping instance divisor %u to %u\n", elem->instance_divisor, screen->info.vdiv_props.maxVertexAttribDivisor);
++         ves->divisor[binding] = MIN2(elem->instance_divisor, screen->info.vdiv_props.maxVertexAttribDivisor);
++      }
+ 
+       VkFormat format;
+       if (zink_get_format_props(screen, elem->src_format)->bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)
+-- 
+2.55.0
+

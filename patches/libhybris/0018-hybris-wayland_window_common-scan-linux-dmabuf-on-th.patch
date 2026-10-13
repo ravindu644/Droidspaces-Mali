@@ -1,0 +1,52 @@
+From 9278dc20762d25c680f081efa8a76d6f9d30df6a Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:29 +0530
+Subject: [PATCH 18/22] hybris: wayland_window_common: scan linux-dmabuf on the
+ window's own queue
+
+The window constructor runs on the app's render thread, and it did a
+roundtrip on the default queue, racing the app's event thread for the sync
+callback. plasmashell lost that race on its panel and never drew it. Use
+the window's queue, destroy the registry afterwards, and destroy the
+dma-buf proxy before the queue it lives on.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/platforms/wayland/wayland_window_common.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index 6a59256..a27c743 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -223,9 +223,13 @@ WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window,
+      * crashed the first present. */
+     this->wl_dmabuf = nullptr;
+     if(!m_android_wlegl && display) {
+-        struct wl_registry *registry = wl_display_get_registry(display);
++        /* On our own queue: this runs on the app's render thread, and a roundtrip on
++         * the default queue races the app's event thread for the sync callback.
++         * plasmashell lost that race on its panel and never drew it. */
++        struct wl_registry *registry = wl_display_get_registry(wl_dpy_wrapper);
+         wl_registry_add_listener(registry, &registry_listener, &this->wl_dmabuf);
+-        wl_display_roundtrip(display);
++        wl_display_roundtrip_queue(display, wl_queue);
++        wl_registry_destroy(registry);
+     }
+ #endif // WANT_LINDROID_DRM
+     WaylandNativeWindow::setBufferCount(3);
+@@ -235,6 +239,11 @@ WaylandNativeWindow::WaylandNativeWindow(struct wl_egl_window *window,
+ WaylandNativeWindow::~WaylandNativeWindow()
+ {
+     destroyBuffers();
++#ifdef WANT_LINDROID_DRM
++    /* Bound on wl_queue, so it has to go before the queue does */
++    if (wl_dmabuf)
++        zwp_linux_dmabuf_v1_destroy(wl_dmabuf);
++#endif
+     if (frame_callback)
+         wl_callback_destroy(frame_callback);
+     wl_proxy_wrapper_destroy(wl_surface_wrapper);
+-- 
+2.55.0
+

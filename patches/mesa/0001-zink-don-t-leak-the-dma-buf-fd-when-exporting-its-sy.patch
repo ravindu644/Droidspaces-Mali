@@ -1,0 +1,45 @@
+From 7f22974d0ab10d8775adaec73f47b14631061e1e Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:46:02 +0530
+Subject: [PATCH 1/5] zink: don't leak the dma-buf fd when exporting its sync
+ file fails
+
+zink_screen_export_dmabuf_semaphore() returned on a failed
+DMA_BUF_IOCTL_EXPORT_SYNC_FILE without closing the dma-buf fd it had just
+exported. That ioctl only exists from Linux 6.0, so on older kernels every
+frame of an X11 client presenting through DRI3 leaked one fd, and after about
+a thousand frames exports failed and the device was lost. Close the fd right
+after the ioctl, as upstream main does, and close the sync file when the
+semaphore import fails.
+
+Origin: backport, upstream main (src/gallium/drivers/zink/zink_screen.c)
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ src/gallium/drivers/zink/zink_screen.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index bc0cc58..1304b56 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -2378,6 +2378,7 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+    }
+ 
+    int ret = drmIoctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
++   close(fd);
+    if (ret) {
+       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+          assert(!"how did this fail?");
+@@ -2398,8 +2399,8 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+       .fd = export.fd,
+    };
+    bool success = VKSCR(ImportSemaphoreFdKHR)(screen->dev, &sdi) == VK_SUCCESS;
+-   close(fd);
+    if (!success) {
++      close(export.fd);
+       VKSCR(DestroySemaphore)(screen->dev, sem, NULL);
+       return VK_NULL_HANDLE;
+    }
+-- 
+2.55.0
+

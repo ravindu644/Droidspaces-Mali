@@ -1,0 +1,51 @@
+From 4c3b08c0c992831976de61939338f82340aeda49 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:26 +0530
+Subject: [PATCH 03/22] hybris: common: never hand out pthread key 0
+
+hybris's pthread_getspecific hook treats key 0 as invalid, while glibc can
+return 0 from pthread_key_create. The Mali driver keeps its per-thread EGL
+state behind a key that came out as 0, lost it, and crashed in
+eglCreateImageKHR. Allocate a fresh key when glibc returns 0.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/common/hooks.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
+index 9b786e0..303f2ff 100644
+--- a/hybris/common/hooks.c
++++ b/hybris/common/hooks.c
+@@ -439,6 +439,19 @@ static int _hybris_hook_pthread_setspecific(pthread_key_t key, const void *ptr)
+     return pthread_setspecific(key, ptr);
+ }
+ 
++/* glibc hands out key 0 to the first caller, but the getspecific hook below
++ * treats 0 as never created, the way bionic does. A blob whose key happens to
++ * be the first in the process (Mali osup, in a bare EGL client) then loses its
++ * thread state on every call. Park key 0 so no Android code can be given it. */
++static int _hybris_hook_pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
++{
++    int ret = pthread_key_create(key, destructor);
++
++    if (ret == 0 && *key == 0)
++        ret = pthread_key_create(key, destructor);
++    return ret;
++}
++
+ static void* _hybris_hook_pthread_getspecific(pthread_key_t key)
+ {
+     TRACE_HOOK("key %d", key);
+@@ -3032,7 +3045,7 @@ static struct _hook hooks_common[] = {
+     HOOK_DIRECT_NO_DEBUG(pthread_getname_np),
+     HOOK_INDIRECT(pthread_setname_np),
+     HOOK_DIRECT_NO_DEBUG(pthread_once),
+-    HOOK_DIRECT_NO_DEBUG(pthread_key_create),
++    HOOK_INDIRECT(pthread_key_create),
+     HOOK_DIRECT(pthread_setspecific),
+     HOOK_INDIRECT(pthread_getspecific),
+     HOOK_INDIRECT(pthread_attr_init),
+-- 
+2.55.0
+

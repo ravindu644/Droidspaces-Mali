@@ -1,0 +1,48 @@
+From f942cbb69e3c8d5b1fd6e8b51b5a39074ba32324 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Tue, 13 Oct 2026 18:17:27 +0530
+Subject: [PATCH 2/3] kde: repaint the owed region on buffer catch-up before
+ KWin 6.6
+
+When the consumer selects a rotation buffer that still owes damage,
+scheduleBufferCatchUp() asks the compositor to run. KWin 6.6 has
+per-layer scheduleRepaint(), but older KWin only gets
+renderLoop()->scheduleRepaint(), which runs a frame without marking the
+layer dirty. KWin then presents without painting, presentFrame() commits
+the selected slot, and its stale content reaches the screen.
+
+The visible result is that every fade blinks: a closing window or the
+Plasma splash toggles on and off once per rotation buffer before it is
+gone. Instrumenting KWin 6.3.6 (Debian 13) showed 119 commits without a
+render out of about 3000 frames, all on catch-up.
+
+Add the slot's accumulated damage as layer damage before scheduling, so
+the catch-up frame actually repaints it. After the change the same
+session committed 2396 frames from 2396 renders and the blinking is gone.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../src/backends/anland/anland_egl_backend.cpp             | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
+index 251d835..30c8b20 100644
+--- a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
++++ b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
+@@ -285,7 +285,12 @@ void AnlandEglLayer::scheduleBufferCatchUp(int index)
+         // KWin 6.6 added per-layer repaint scheduling.
+         scheduleRepaint(nullptr);
+ #else
+-        // Older KWin versions schedule the compositor through the render loop.
++        // Older KWin versions schedule the compositor through the render loop,
++        // which runs a frame without marking this layer dirty. KWin then
++        // presents without painting and the slot's stale content reaches the
++        // screen: fades blink once per rotation buffer. Turn the owed region
++        // into layer damage so the frame actually repaints it.
++        addRepaint(m_accumDamage[index]);
+         m_output->renderLoop()->scheduleRepaint();
+ #endif
+     }
+-- 
+2.55.0
+

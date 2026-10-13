@@ -1,0 +1,153 @@
+From 3f1d39431170adf975458ad0d56e482859700195 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 02:15:51 +0530
+Subject: [PATCH 3/3] kde: stop rendering an idle desktop at the full refresh
+ rate
+
+On KWin 6.3 the backend kept KWin compositing and committing 60 frames a
+second with nothing changing on screen, about a third of a CPU core on a
+phone, and it slowed everything else down. Three loops, each enough on its
+own once the others were gone:
+
+- present() committed every composite. KWin before 6.6 calls present()
+  even when nothing was painted, so the slot's old content was committed
+  and its PRESENTED event started the next round. The layer now records
+  whether doEndFrame() rendered anything and present() drops the frame
+  otherwise; the OutputFrame's destructor tells the RenderLoop.
+
+- onConsumerReady() scheduled a repaint after every presented frame.
+  Compositor::prePaintPass() clears a layer's scheduled flag only when it
+  also has a repaint region, so that composite always found the layer
+  dirty, and CursorScene::prePaint() returns the software cursor's rect as
+  damage every time. RenderLoop already reschedules after a frame when
+  something asked for one, so only a buffer-ready that does not complete
+  one of our frames wakes the compositor now.
+
+- The pre-6.6 catch-up turned each slot's debt into a frame whose cursor
+  damage became new debt for the other slots. Leave the debt in the slot;
+  the next real frame repaints it through beginFrame()'s repaint. The fade
+  blink the catch-up addressed came from the first loop.
+
+Idle now: one frame in five seconds. Animations still present every
+vblank.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../backends/anland/anland_egl_backend.cpp    | 21 +++++++++++------
+ .../src/backends/anland/anland_egl_backend.h  |  3 +++
+ .../src/backends/anland/anland_output.cpp     | 23 +++++++++++++++++--
+ 3 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
+index 30c8b20..7fb96f7 100644
+--- a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
++++ b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.cpp
+@@ -285,13 +285,12 @@ void AnlandEglLayer::scheduleBufferCatchUp(int index)
+         // KWin 6.6 added per-layer repaint scheduling.
+         scheduleRepaint(nullptr);
+ #else
+-        // Older KWin versions schedule the compositor through the render loop,
+-        // which runs a frame without marking this layer dirty. KWin then
+-        // presents without painting and the slot's stale content reaches the
+-        // screen: fades blink once per rotation buffer. Turn the owed region
+-        // into layer damage so the frame actually repaints it.
+-        addRepaint(m_accumDamage[index]);
+-        m_output->renderLoop()->scheduleRepaint();
++        // Older KWin has no per-layer scheduling, and every frame it composites
++        // also damages the software cursor (CursorScene::prePaint() returns its
++        // rect unconditionally). A catch-up frame therefore always made new damage
++        // for the other slots, so the slots woke each other forever and an idle
++        // desktop rendered at the full refresh rate. Leave the debt in the slot
++        // instead: the next real frame repaints it through beginFrame()'s repaint.
+ #endif
+     }
+ }
+@@ -337,6 +336,9 @@ bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegi
+         glFinish();
+     }
+     setPendingFence(fence.takeFileDescriptor().take());
++    // KWin runs a paint pass whenever a layer reports it needs one, even when the
++    // region to render comes out empty. Such a frame changed nothing.
++    m_painted = !renderedDeviceRegion.isEmpty();
+     return true;
+ }
+ 
+@@ -350,6 +352,11 @@ void AnlandEglLayer::setPendingFence(int fd)
+     m_pendingFence = fd;
+ }
+ 
++bool AnlandEglLayer::takePainted()
++{
++    return std::exchange(m_painted, false);
++}
++
+ int AnlandEglLayer::takePendingFence()
+ {
+     const int fd = m_pendingFence;
+diff --git a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.h b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.h
+index 1001025..de7a3aa 100644
+--- a/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.h
++++ b/producers/kde/anland_backend/src/backends/anland/anland_egl_backend.h
+@@ -90,6 +90,8 @@ public:
+      */
+     void setPendingFence(int fd);
+     int takePendingFence();
++    /* True once per frame the layer rendered, so present() can skip frames it did not. */
++    bool takePainted();
+ 
+     /** Update the transport handle after the backend rebuilds its session. */
+     void setDevice(anland_device *device)
+@@ -133,6 +135,7 @@ private:
+     /* Render fence for the frame being composed, or -1. Created in doEndFrame(),
+      * consumed by the backend's commit when it presents. */
+     int m_pendingFence = -1;
++    bool m_painted = false;
+     std::array<std::shared_ptr<GLTexture>, ANLAND_DEVICE_MAX_BUFS> m_textures;
+     std::array<std::unique_ptr<GLFramebuffer>, ANLAND_DEVICE_MAX_BUFS> m_fbos;
+     /* Per-buffer accumulated damage: each buffer must remember everything that
+diff --git a/producers/kde/anland_backend/src/backends/anland/anland_output.cpp b/producers/kde/anland_backend/src/backends/anland/anland_output.cpp
+index b86e10e..1bc8268 100644
+--- a/producers/kde/anland_backend/src/backends/anland/anland_output.cpp
++++ b/producers/kde/anland_backend/src/backends/anland/anland_output.cpp
+@@ -61,6 +61,18 @@ bool AnlandOutput::present(const QList<OutputLayer *> &layersToUpdate, const std
+ void AnlandOutput::present(const std::shared_ptr<OutputFrame> &frame)
+ {
+ #endif
++    // KWin 6.3 calls present() after every composite, painted or not. Committing an
++    // unpainted frame shows whatever the slot last held, and its PRESENTED event
++    // schedules the next composite, so an idle desktop ran at the full refresh rate.
++    // Drop it instead: the OutputFrame's destructor tells the RenderLoop.
++    if (!m_eglLayer || !m_eglLayer->takePainted()) {
++#ifdef ANLAND_KWIN_66
++        return true;
++#else
++        return;
++#endif
++    }
++
+     // The scene has already been rendered into the daemon's dmabuf by the layer
+     // (AnlandEglLayer::doEndFrame). Hand it to the consumer now.
+     m_frame = frame;
+@@ -162,10 +174,17 @@ void AnlandOutput::onConsumerReady()
+ {
+     if (m_awaitingPresent) {
+         m_awaitingPresent = false;
++        // RenderLoop reschedules on its own when something asked for a repaint
++        // while this frame was in flight. Forcing one here composited after every
++        // frame, and KWin 6.3 never clears a layer's scheduled flag when it has no
++        // repaint region (Compositor::prePaintPass()), so that frame always found
++        // the layer dirty and the software cursor damaged: an idle desktop kept
++        // rendering at the full refresh rate.
+         completeFrame();
++        return;
+     }
+-    // Render the next frame in lockstep with the consumer, exactly as the 5.27
+-    // backend did: the consumer's buffer-ready drives scheduleRepaint().
++    // A buffer-ready that does not complete one of our frames (after a reconnect,
++    // say) still has to wake the compositor.
+     m_renderLoop->scheduleRepaint();
+ }
+ 
+-- 
+2.55.0
+

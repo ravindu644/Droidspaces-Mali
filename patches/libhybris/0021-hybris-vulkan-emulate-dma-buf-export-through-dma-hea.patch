@@ -1,0 +1,448 @@
+From 18f4ca0b57f3291b3d91f94c04528c37120c5f19 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:29 +0530
+Subject: [PATCH 21/22] hybris: vulkan: emulate dma-buf export through dma-heap
+ imports
+
+The Mali driver advertises VK_KHR_external_memory_fd and
+VK_EXT_external_memory_dma_buf, but only imports dma-bufs, and only into
+buffers; vkGetMemoryFdKHR returns VK_SUCCESS without writing the fd. Zink
+needs export for every GBM buffer (Xwayland glamor) and for X11 clients
+presenting through DRI3.
+
+Allocate exportable memory from /dev/dma_heap/system (HYBRIS_VK_DMA_HEAP)
+and import it, which the driver renders into correctly, then hand out
+duplicates of our fd. Imported dma-bufs are tracked too, because Zink
+re-exports them for implicit sync. External-memory create info is stripped
+from images and buffers, and the capability queries report export and
+import.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/vulkan/vulkan.c | 335 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 325 insertions(+), 10 deletions(-)
+
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index d511b2f..763cadf 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -29,6 +29,9 @@
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <sys/sysmacros.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <unistd.h>
+ 
+ #include <hybris/common/binding.h>
+ #include <hybris/common/floating_point_abi.h>
+@@ -147,6 +150,8 @@ void vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllo
+ VULKAN_IDLOAD(vkDestroySurfaceKHR);
+ #endif
+ 
++static PFN_vkVoidFunction hybris_dmabuf_hook(const char *pName);
++
+ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+ {
+     if (_vkGetInstanceProcAddr == NULL) {
+@@ -176,6 +181,10 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+     } else if (!strcmp(pName, "vkDestroySurfaceKHR")) {
+         return (PFN_vkVoidFunction)vkDestroySurfaceKHR;
+ #endif
++    } else {
++        PFN_vkVoidFunction hook = hybris_dmabuf_hook(pName);
++        if (hook)
++            return hook;
+     }
+ 
+     return (*_vkGetInstanceProcAddr)(instance, pName);
+@@ -184,16 +193,21 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+ static PFN_vkCreateSwapchainKHR hybris_real_create_swapchain;
+ VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain);
+ 
++static PFN_vkGetDeviceProcAddr hybris_real_gdpa;
++
+ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice device, const char *pName)
+ {
+     static PFN_vkGetDeviceProcAddr real;
++    PFN_vkVoidFunction hook;
+ 
+     if (!real)
+-        real = (PFN_vkGetDeviceProcAddr)_android_vulkan_dlsym("vkGetDeviceProcAddr");
++        hybris_real_gdpa = real = (PFN_vkGetDeviceProcAddr)_android_vulkan_dlsym("vkGetDeviceProcAddr");
+     if (!strcmp(pName, "vkCreateSwapchainKHR")) {
+         hybris_real_create_swapchain = (PFN_vkCreateSwapchainKHR)real(device, pName);
+         return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
+     }
++    if ((hook = hybris_dmabuf_hook(pName)))
++        return hook;
+     return real(device, pName);
+ }
+ VULKAN_IDLOAD(vkCreateDevice);
+@@ -257,8 +271,8 @@ VULKAN_IDLOAD(vkGetDeviceQueue);
+ VULKAN_IDLOAD(vkQueueSubmit);
+ VULKAN_IDLOAD(vkQueueWaitIdle);
+ VULKAN_IDLOAD(vkDeviceWaitIdle);
+-VULKAN_IDLOAD(vkAllocateMemory);
+-VULKAN_IDLOAD(vkFreeMemory);
++/* vkAllocateMemory: dma-buf export emulation */
++/* vkFreeMemory: dma-buf export emulation */
+ VULKAN_IDLOAD(vkMapMemory);
+ VULKAN_IDLOAD(vkUnmapMemory);
+ VULKAN_IDLOAD(vkFlushMappedMemoryRanges);
+@@ -286,11 +300,11 @@ VULKAN_IDLOAD(vkResetEvent);
+ VULKAN_IDLOAD(vkCreateQueryPool);
+ VULKAN_IDLOAD(vkDestroyQueryPool);
+ VULKAN_IDLOAD(vkGetQueryPoolResults);
+-VULKAN_IDLOAD(vkCreateBuffer);
++/* vkCreateBuffer: dma-buf export emulation */
+ VULKAN_IDLOAD(vkDestroyBuffer);
+ VULKAN_IDLOAD(vkCreateBufferView);
+ VULKAN_IDLOAD(vkDestroyBufferView);
+-VULKAN_IDLOAD(vkCreateImage);
++/* vkCreateImage: dma-buf export emulation */
+ VULKAN_IDLOAD(vkDestroyImage);
+ VULKAN_IDLOAD(vkGetImageSubresourceLayout);
+ VULKAN_IDLOAD(vkCreateImageView);
+@@ -422,7 +436,7 @@ void vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalD
+     hybris_cap_api_version(&props->properties);
+ }
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties2);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceImageFormatProperties2);
++/* vkGetPhysicalDeviceImageFormatProperties2: dma-buf export emulation */
+ VULKAN_IDLOAD(vkGetPhysicalDeviceQueueFamilyProperties2);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceMemoryProperties2);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSparseImageFormatProperties2);
+@@ -433,7 +447,7 @@ VULKAN_IDLOAD(vkDestroySamplerYcbcrConversion);
+ VULKAN_IDLOAD(vkCreateDescriptorUpdateTemplate);
+ VULKAN_IDLOAD(vkDestroyDescriptorUpdateTemplate);
+ VULKAN_IDLOAD(vkUpdateDescriptorSetWithTemplate);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceExternalBufferProperties);
++/* vkGetPhysicalDeviceExternalBufferProperties: dma-buf export emulation */
+ VULKAN_IDLOAD(vkGetPhysicalDeviceExternalFenceProperties);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceExternalSemaphoreProperties);
+ VULKAN_IDLOAD(vkGetDescriptorSetLayoutSupport);
+@@ -555,7 +569,7 @@ VULKAN_IDLOAD(vkCmdEndRenderingKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFeatures2KHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceProperties2KHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties2KHR);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceImageFormatProperties2KHR);
++/* vkGetPhysicalDeviceImageFormatProperties2KHR: dma-buf export emulation */
+ VULKAN_IDLOAD(vkGetPhysicalDeviceQueueFamilyProperties2KHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceMemoryProperties2KHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSparseImageFormatProperties2KHR);
+@@ -564,8 +578,309 @@ VULKAN_IDLOAD(vkCmdSetDeviceMaskKHR);
+ VULKAN_IDLOAD(vkCmdDispatchBaseKHR);
+ VULKAN_IDLOAD(vkTrimCommandPoolKHR);
+ VULKAN_IDLOAD(vkEnumeratePhysicalDeviceGroupsKHR);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceExternalBufferPropertiesKHR);
+-VULKAN_IDLOAD(vkGetMemoryFdKHR);
++/* vkGetPhysicalDeviceExternalBufferPropertiesKHR: dma-buf export emulation */
++/* dma-buf export emulation.
++ *
++ * The Mali blob advertises VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf,
++ * but its external memory properties say dma-bufs can only be imported, and only into
++ * buffers. vkGetMemoryFdKHR returns VK_SUCCESS without writing the fd. zink needs export
++ * for every GBM buffer (Xwayland's glamor) and for GLX/EGL on X11 through DRI3, and Mesa
++ * feeds the "opaque" fd straight to drmPrimeFDToHandle().
++ *
++ * Do what bionic-vulkan-wrapper does: allocate exportable memory ourselves from a
++ * dma-heap and import it, which the Mali renders into fine (probes/vkheapimg.c), then
++ * hand out duplicates of our fd. Imported dma-bufs are tracked too, because zink
++ * re-exports them for implicit sync. Images and buffers lose the external-memory create
++ * info the Mali rejects, and the capability queries report export and import.
++ *
++ * ponytail: the pNext unlinking below briefly edits the caller's const chain, so two
++ * threads sharing one chain would race; Mesa builds chains on the stack. */
++#include <linux/dma-heap.h>
++#include <sys/ioctl.h>
++
++#define HYBRIS_DMABUF_TYPES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT | \
++                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
++
++struct hybris_dmabuf_mem {
++    VkDeviceMemory mem;
++    int fd;
++    struct hybris_dmabuf_mem *next;
++};
++static struct hybris_dmabuf_mem *hybris_dmabuf_mems;
++static pthread_mutex_t hybris_dmabuf_lock = PTHREAD_MUTEX_INITIALIZER;
++static int hybris_heap_fd = -1;
++static pthread_once_t hybris_heap_once = PTHREAD_ONCE_INIT;
++
++static void hybris_heap_open(void)
++{
++    const char *heap = getenv("HYBRIS_VK_DMA_HEAP");
++    hybris_heap_fd = open(heap ? heap : "/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
++}
++
++static int hybris_heap_alloc(VkDeviceSize size)
++{
++    pthread_once(&hybris_heap_once, hybris_heap_open);
++    if (hybris_heap_fd < 0)
++        return -1;
++    struct dma_heap_allocation_data a = { .len = (size + 4095) & ~(VkDeviceSize)4095,
++                                          .fd_flags = O_RDWR | O_CLOEXEC };
++    return ioctl(hybris_heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0 ? -1 : (int)a.fd;
++}
++
++/* Takes the first struct of type t out of s's pNext chain; hybris_relink() puts it back. */
++static VkBaseOutStructure *hybris_unlink(const void *s, VkStructureType t, VkBaseOutStructure **prev)
++{
++    for (VkBaseOutStructure *p = (VkBaseOutStructure *)s; p->pNext; p = p->pNext) {
++        if (p->pNext->sType == t) {
++            VkBaseOutStructure *node = p->pNext;
++            p->pNext = node->pNext;
++            *prev = p;
++            return node;
++        }
++    }
++    return NULL;
++}
++
++static void hybris_relink(VkBaseOutStructure *prev, VkBaseOutStructure *node)
++{
++    if (node)
++        prev->pNext = node;
++}
++
++static const void *hybris_find(const void *s, VkStructureType t)
++{
++    for (const VkBaseInStructure *p = ((const VkBaseInStructure *)s)->pNext; p; p = p->pNext)
++        if (p->sType == t)
++            return p;
++    return NULL;
++}
++
++static void hybris_dmabuf_track(VkDeviceMemory mem, int fd)
++{
++    struct hybris_dmabuf_mem *m = malloc(sizeof(*m));
++    m->mem = mem;
++    m->fd = fd;
++    pthread_mutex_lock(&hybris_dmabuf_lock);
++    m->next = hybris_dmabuf_mems;
++    hybris_dmabuf_mems = m;
++    pthread_mutex_unlock(&hybris_dmabuf_lock);
++}
++
++/* The fd behind memory we know, or -1. take removes the record. */
++static int hybris_dmabuf_fd(VkDeviceMemory mem, int take)
++{
++    int fd = -1;
++    pthread_mutex_lock(&hybris_dmabuf_lock);
++    for (struct hybris_dmabuf_mem **p = &hybris_dmabuf_mems; *p; p = &(*p)->next) {
++        if ((*p)->mem == mem) {
++            fd = (*p)->fd;
++            if (take) {
++                struct hybris_dmabuf_mem *m = *p;
++                *p = m->next;
++                free(m);
++            }
++            break;
++        }
++    }
++    pthread_mutex_unlock(&hybris_dmabuf_lock);
++    return fd;
++}
++
++static PFN_vkVoidFunction hybris_dev_fn(VkDevice device, const char *name)
++{
++    if (!hybris_real_gdpa)
++        hybris_real_gdpa = (PFN_vkGetDeviceProcAddr)_android_vulkan_dlsym("vkGetDeviceProcAddr");
++    return hybris_real_gdpa(device, name);
++}
++
++VkResult vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
++                          const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory)
++{
++    static PFN_vkAllocateMemory real;
++    if (!real)
++        real = (PFN_vkAllocateMemory)_android_vulkan_dlsym("vkAllocateMemory");
++
++    const VkImportMemoryFdInfoKHR *imp =
++        hybris_find(pAllocateInfo, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR);
++    if (imp) {
++        /* A successful import consumes the fd, so keep our own copy for vkGetMemoryFdKHR */
++        int fd = (imp->handleType & HYBRIS_DMABUF_TYPES) ? fcntl(imp->fd, F_DUPFD_CLOEXEC, 0) : -1;
++        VkResult ret = real(device, pAllocateInfo, pAllocator, pMemory);
++        if (ret == VK_SUCCESS && fd >= 0)
++            hybris_dmabuf_track(*pMemory, fd);
++        else if (fd >= 0)
++            close(fd);
++        return ret;
++    }
++
++    const VkExportMemoryAllocateInfo *exp =
++        hybris_find(pAllocateInfo, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++    if (!exp || !(exp->handleTypes & HYBRIS_DMABUF_TYPES))
++        return real(device, pAllocateInfo, pAllocator, pMemory);
++
++    int fd = hybris_heap_alloc(pAllocateInfo->allocationSize);
++    if (fd < 0) {
++        fprintf(stderr, "hybris: dma-heap allocation of %llu bytes failed; this memory will not "
++                "be exportable\n", (unsigned long long)pAllocateInfo->allocationSize);
++        return real(device, pAllocateInfo, pAllocator, pMemory);
++    }
++
++    PFN_vkGetMemoryFdPropertiesKHR props_fn =
++        (PFN_vkGetMemoryFdPropertiesKHR)hybris_dev_fn(device, "vkGetMemoryFdPropertiesKHR");
++    VkMemoryFdPropertiesKHR props = { VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
++    if (props_fn)
++        props_fn(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &props);
++
++    VkBaseOutStructure *prev, *node = hybris_unlink(pAllocateInfo,
++        VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &prev);
++    VkImportMemoryFdInfoKHR import = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++        pAllocateInfo->pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++        fcntl(fd, F_DUPFD_CLOEXEC, 0) };
++    VkMemoryAllocateInfo info = *pAllocateInfo;
++    info.pNext = &import;
++    /* The import may only land in types the dma-buf allows */
++    if (props.memoryTypeBits && !(props.memoryTypeBits & (1u << info.memoryTypeIndex)))
++        info.memoryTypeIndex = __builtin_ctz(props.memoryTypeBits);
++    VkResult ret = real(device, &info, pAllocator, pMemory);
++    hybris_relink(prev, node);
++
++    if (ret != VK_SUCCESS) {
++        fprintf(stderr, "hybris: importing a %llu-byte dma-buf failed (%d, type %u, fd types 0x%x); "
++                "this memory will not be exportable\n", (unsigned long long)info.allocationSize,
++                ret, info.memoryTypeIndex, props.memoryTypeBits);
++        close(import.fd);
++        close(fd);
++        return real(device, pAllocateInfo, pAllocator, pMemory);
++    }
++    hybris_dmabuf_track(*pMemory, fd);
++    return VK_SUCCESS;
++}
++
++void vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *pAllocator)
++{
++    static PFN_vkFreeMemory real;
++    if (!real)
++        real = (PFN_vkFreeMemory)_android_vulkan_dlsym("vkFreeMemory");
++    int fd = memory ? hybris_dmabuf_fd(memory, 1) : -1;
++    real(device, memory, pAllocator);
++    if (fd >= 0)
++        close(fd);
++}
++
++VkResult vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFd)
++{
++    int fd = (pGetFdInfo->handleType & HYBRIS_DMABUF_TYPES) ? hybris_dmabuf_fd(pGetFdInfo->memory, 0) : -1;
++    if (fd >= 0) {
++        *pFd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
++        return *pFd >= 0 ? VK_SUCCESS : VK_ERROR_TOO_MANY_OBJECTS;
++    }
++    /* The Mali's own export reports success without an fd; say so instead of lying */
++    *pFd = -1;
++    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++
++VkResult vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
++                       const VkAllocationCallbacks *pAllocator, VkImage *pImage)
++{
++    static PFN_vkCreateImage real;
++    if (!real)
++        real = (PFN_vkCreateImage)_android_vulkan_dlsym("vkCreateImage");
++    const VkExternalMemoryImageCreateInfo *ext =
++        hybris_find(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
++    if (!ext || (ext->handleTypes & ~HYBRIS_DMABUF_TYPES))
++        return real(device, pCreateInfo, pAllocator, pImage);
++    VkBaseOutStructure *prev, *node = hybris_unlink(pCreateInfo,
++        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &prev);
++    VkResult ret = real(device, pCreateInfo, pAllocator, pImage);
++    hybris_relink(prev, node);
++    return ret;
++}
++
++VkResult vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
++                        const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
++{
++    static PFN_vkCreateBuffer real;
++    if (!real)
++        real = (PFN_vkCreateBuffer)_android_vulkan_dlsym("vkCreateBuffer");
++    const VkExternalMemoryBufferCreateInfo *ext =
++        hybris_find(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
++    if (!ext || (ext->handleTypes & ~HYBRIS_DMABUF_TYPES))
++        return real(device, pCreateInfo, pAllocator, pBuffer);
++    VkBaseOutStructure *prev, *node = hybris_unlink(pCreateInfo,
++        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, &prev);
++    VkResult ret = real(device, pCreateInfo, pAllocator, pBuffer);
++    hybris_relink(prev, node);
++    return ret;
++}
++
++static const VkExternalMemoryProperties hybris_dmabuf_props = {
++    VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++    HYBRIS_DMABUF_TYPES, HYBRIS_DMABUF_TYPES,
++};
++
++VkResult vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
++    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo, VkImageFormatProperties2 *pImageFormatProperties)
++{
++    static PFN_vkGetPhysicalDeviceImageFormatProperties2 real;
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceImageFormatProperties2)_android_vulkan_dlsym("vkGetPhysicalDeviceImageFormatProperties2");
++    const VkPhysicalDeviceExternalImageFormatInfo *ext =
++        hybris_find(pImageFormatInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
++    if (!ext || !(ext->handleType & HYBRIS_DMABUF_TYPES))
++        return real(physicalDevice, pImageFormatInfo, pImageFormatProperties);
++    VkBaseOutStructure *prev, *node = hybris_unlink(pImageFormatInfo,
++        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &prev);
++    VkResult ret = real(physicalDevice, pImageFormatInfo, pImageFormatProperties);
++    hybris_relink(prev, node);
++    VkExternalImageFormatProperties *out = (VkExternalImageFormatProperties *)
++        hybris_find(pImageFormatProperties, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
++    if (ret == VK_SUCCESS && out)
++        out->externalMemoryProperties = hybris_dmabuf_props;
++    return ret;
++}
++
++VkResult vkGetPhysicalDeviceImageFormatProperties2KHR(VkPhysicalDevice physicalDevice,
++    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo, VkImageFormatProperties2 *pImageFormatProperties)
++{
++    return vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
++}
++
++void vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
++    const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo, VkExternalBufferProperties *pExternalBufferProperties)
++{
++    static PFN_vkGetPhysicalDeviceExternalBufferProperties real;
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceExternalBufferProperties)_android_vulkan_dlsym("vkGetPhysicalDeviceExternalBufferProperties");
++    real(physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
++    if (pExternalBufferInfo->handleType & HYBRIS_DMABUF_TYPES)
++        pExternalBufferProperties->externalMemoryProperties = hybris_dmabuf_props;
++}
++
++void vkGetPhysicalDeviceExternalBufferPropertiesKHR(VkPhysicalDevice physicalDevice,
++    const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo, VkExternalBufferProperties *pExternalBufferProperties)
++{
++    vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
++}
++
++static PFN_vkVoidFunction hybris_dmabuf_hook(const char *pName)
++{
++    static const struct { const char *name; PFN_vkVoidFunction fn; } hooks[] = {
++        { "vkAllocateMemory", (PFN_vkVoidFunction)vkAllocateMemory },
++        { "vkFreeMemory", (PFN_vkVoidFunction)vkFreeMemory },
++        { "vkGetMemoryFdKHR", (PFN_vkVoidFunction)vkGetMemoryFdKHR },
++        { "vkCreateImage", (PFN_vkVoidFunction)vkCreateImage },
++        { "vkCreateBuffer", (PFN_vkVoidFunction)vkCreateBuffer },
++        { "vkGetPhysicalDeviceImageFormatProperties2", (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties2 },
++        { "vkGetPhysicalDeviceImageFormatProperties2KHR", (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties2KHR },
++        { "vkGetPhysicalDeviceExternalBufferProperties", (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalBufferProperties },
++        { "vkGetPhysicalDeviceExternalBufferPropertiesKHR", (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalBufferPropertiesKHR },
++    };
++    for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++)
++        if (!strcmp(pName, hooks[i].name))
++            return hooks[i].fn;
++    return NULL;
++}
++/* end of dma-buf export emulation */
+ VULKAN_IDLOAD(vkGetMemoryFdPropertiesKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceExternalSemaphorePropertiesKHR);
+ VULKAN_IDLOAD(vkImportSemaphoreFdKHR);
+-- 
+2.55.0
+

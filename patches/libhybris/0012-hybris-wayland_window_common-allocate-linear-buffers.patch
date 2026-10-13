@@ -1,0 +1,38 @@
+From 2b22708c79cb6ad6137e37f2009e2ac286cf3c55 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:27 +0530
+Subject: [PATCH 12/22] hybris: wayland_window_common: allocate linear buffers
+ for dma-buf clients
+
+Without a CPU usage bit, MediaTek gralloc picked a compressed/tiled layout
+that the compositor read as linear: static-like noise and no frame
+callbacks. Ask for GRALLOC_USAGE_SW_READ_RARELY so the layout is linear.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/platforms/wayland/wayland_window_common.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index c3863fe..4d33ad2 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -717,7 +717,14 @@ DrmWaylandBuffer::DrmWaylandBuffer(
+     format = _format;
+     usage = _usage;
+ 
+-    int ret = hybris_gralloc_allocate(width, height, format, (uint32_t)usage, &handle, (uint32_t*)&stride);
++    /* init() tells the compositor DRM_FORMAT_MOD_LINEAR. For GPU render+texture
++     * usage, gralloc is free to pick a compressed (AFBC) or tiled layout, which the
++     * compositor then reads as noise. CPU access rules those layouts out.
++     * ponytail: linear costs bandwidth; pass the real modifier from the gralloc4
++     * metadata instead if throughput matters. */
++    int ret = hybris_gralloc_allocate(width, height, format,
++                                      (uint32_t)usage | GRALLOC_USAGE_SW_READ_RARELY,
++                                      &handle, (uint32_t*)&stride);
+     if (ret != 0) {
+         fprintf(stderr, "lindroid-drm: failed to allocate gralloc buffer: %d\n", ret);
+         abort();
+-- 
+2.55.0
+

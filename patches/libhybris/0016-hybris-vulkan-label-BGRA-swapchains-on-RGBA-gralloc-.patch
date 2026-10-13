@@ -1,0 +1,160 @@
+From f18d09d0a622167fe0a1089b6e06f6a1261b5b42 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:28 +0530
+Subject: [PATCH 16/22] hybris: vulkan: label BGRA swapchains on RGBA gralloc
+ as ARGB8888
+
+Zink's kopper creates B8G8R8A8 swapchains. The Android swapchain backs them
+with RGBA gralloc buffers while the driver writes BGRA bytes, and the
+buffers went out as ABGR8888: red and blue swapped. Track BGRA swapchain
+formats and label their buffers ARGB8888/XRGB8888.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../wayland/wayland_window_common.cpp         | 11 +++++++++
+ .../wayland/vulkanplatform_wayland.cpp        |  6 +++++
+ hybris/vulkan/vulkan.c                        | 24 +++++++++++++++++--
+ hybris/vulkan/ws.c                            | 14 +++++++++++
+ hybris/vulkan/ws.h                            |  1 +
+ 5 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index 28931cc..6a59256 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -737,6 +737,13 @@ DrmWaylandBuffer::DrmWaylandBuffer(
+ /* gralloc (HAL) format to DRM fourcc and bytes per pixel. Everything used to be sent as
+  * ABGR8888, so zink's 10-bit swapchains (EGL lists 10:10:10:2 configs first) came out
+  * with scrambled colours, and RGBX was labelled XRGB (red and blue swapped). */
++/* Set by the Vulkan platform when a swapchain uses B8G8R8A8. Android's swapchain code
++ * knows no BGRA, so it allocates RGBA gralloc buffers, but the driver still writes BGRA
++ * bytes for that VkFormat; label the dma-buf to match (zink's kopper always asks for
++ * B8G8R8A8, which showed red and blue swapped).
++ * ponytail: process-wide, one swapchain format per app; per-surface if that changes. */
++extern "C" { int hybris_wayland_swap_rb = 0; }
++
+ static uint32_t hal_to_drm_format(int hal, int *bpp)
+ {
+     *bpp = 4;
+@@ -776,6 +783,10 @@ void DrmWaylandBuffer::init(
+      * 1x1 one. Only dma-bufs answer lseek(SEEK_END), and the pixels are the largest. */
+     int bpp;
+     uint32_t req_format = hal_to_drm_format(format, &bpp);
++    if (hybris_wayland_swap_rb && req_format == GBM_FORMAT_ABGR8888)
++        req_format = GBM_FORMAT_ARGB8888;
++    else if (hybris_wayland_swap_rb && req_format == GBM_FORMAT_XBGR8888)
++        req_format = GBM_FORMAT_XRGB8888;
+     int pixel_fd = -1;
+     off_t best = 0;
+     for (int i = 0; i < nh->numFds; i++) {
+diff --git a/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp b/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
+index 073781c..07becfe 100644
+--- a/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
++++ b/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
+@@ -288,6 +288,12 @@ static void waylandws_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surf
+     }
+ }
+ 
++extern "C" int hybris_wayland_swap_rb;
++extern "C" void waylandws_set_swap_rb(int swap)
++{
++    hybris_wayland_swap_rb = swap;
++}
++
+ extern "C" void waylandws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr)
+ {
+     if (_vkGetInstanceProcAddr == NULL)
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 727268d..9177f6f 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -181,7 +181,18 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+     return (*_vkGetInstanceProcAddr)(instance, pName);
+ }
+ 
+-VULKAN_IDLOAD(vkGetDeviceProcAddr);
++PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice device, const char *pName)
++{
++    static PFN_vkGetDeviceProcAddr real;
++
++    if (!real)
++        real = (PFN_vkGetDeviceProcAddr)_android_vulkan_dlsym("vkGetDeviceProcAddr");
++    if (!strcmp(pName, "vkCreateSwapchainKHR")) {
++        hybris_real_create_swapchain = (PFN_vkCreateSwapchainKHR)real(device, pName);
++        return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
++    }
++    return real(device, pName);
++}
+ VULKAN_IDLOAD(vkCreateDevice);
+ VULKAN_IDLOAD(vkDestroyDevice);
+ /* Debug knob for bisecting driver bugs from a layer-less stack (Khronos layers can't sit
+@@ -495,7 +506,16 @@ VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevi
+ }
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceFormatsKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfacePresentModesKHR);
+-VULKAN_IDLOAD(vkCreateSwapchainKHR);
++static PFN_vkCreateSwapchainKHR hybris_real_create_swapchain;
++
++VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
++{
++    if (!hybris_real_create_swapchain)
++        hybris_real_create_swapchain = (PFN_vkCreateSwapchainKHR)_android_vulkan_dlsym("vkCreateSwapchainKHR");
++    ws_set_swap_rb(pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_UNORM ||
++                   pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_SRGB);
++    return hybris_real_create_swapchain(device, pCreateInfo, pAllocator, pSwapchain);
++}
+ VULKAN_IDLOAD(vkDestroySwapchainKHR);
+ VULKAN_IDLOAD(vkGetSwapchainImagesKHR);
+ VULKAN_IDLOAD(vkAcquireNextImageKHR);
+diff --git a/hybris/vulkan/ws.c b/hybris/vulkan/ws.c
+index 51cb71e..7aaeb61 100644
+--- a/hybris/vulkan/ws.c
++++ b/hybris/vulkan/ws.c
+@@ -23,6 +23,7 @@
+ #include <sys/auxv.h>
+ 
+ static struct ws_module *ws = NULL;
++static void *ws_handle = NULL;
+ 
+ static void _init_ws()
+ {
+@@ -49,6 +50,7 @@ static void _init_ws()
+             fprintf(stderr, "ERROR: %s\n\t%s\n", ws_name, dlerror());
+             assert(0);
+         }
++        ws_handle = wsmod;
+         ws = dlsym(wsmod, "ws_module_info");
+         assert(ws != NULL);
+         ws->init_module(&hybris_vulkan_interface);
+@@ -90,6 +92,18 @@ void ws_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkA
+ }
+ #endif
+ 
++/* Optional: only the Wayland platform exports it (no ws_module slot, so other platforms
++ * and older plugins keep working). */
++void ws_set_swap_rb(int swap)
++{
++    void (*set)(int);
++
++    _init_ws();
++    set = (void (*)(int))dlsym(ws_handle, "waylandws_set_swap_rb");
++    if (set)
++        set(swap);
++}
++
+ void ws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr)
+ {
+     _init_ws();
+diff --git a/hybris/vulkan/ws.h b/hybris/vulkan/ws.h
+index a2d080c..22c7596 100644
+--- a/hybris/vulkan/ws.h
++++ b/hybris/vulkan/ws.h
+@@ -52,4 +52,5 @@ VkBool32 ws_vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice ph
+ void ws_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator);
+ #endif
+ void ws_vkSetInstanceProcAddrFunc(PFN_vkVoidFunction addr);
++void ws_set_swap_rb(int swap);
+ #endif
+-- 
+2.55.0
+

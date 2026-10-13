@@ -1,0 +1,138 @@
+From 08dab343fd8991be8b941d68865e9deea87d125e Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:28 +0530
+Subject: [PATCH 15/22] hybris: vulkan: add HYBRIS_VK_HIDE_EXTS and
+ HYBRIS_VK_API_VERSION
+
+Khronos layers can't sit on top of an Android loader (both own the first
+word of dispatchable objects), so there is no validation layer to bisect
+driver bugs with. Let the environment hide device extensions and cap the
+API version. On Mali, hiding VK_EXT_extended_dynamic_state makes Zink's
+draws render.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/vulkan/vulkan.c | 79 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 301cb4e..727268d 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -24,6 +24,7 @@
+ 
+ #include <vulkan/vulkan.h>
+ #include <dlfcn.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+@@ -93,7 +94,24 @@ VULKAN_IDLOAD(vkEnumeratePhysicalDevices);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFeatures);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceImageFormatProperties);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceProperties);
++static void hybris_cap_api_version(VkPhysicalDeviceProperties *props)
++{
++    const char *v = getenv("HYBRIS_VK_API_VERSION");
++    unsigned maj, min;
++
++    if (v && sscanf(v, "%u.%u", &maj, &min) == 2 && props->apiVersion > VK_MAKE_VERSION(maj, min, 0))
++        props->apiVersion = VK_MAKE_VERSION(maj, min, 0);
++}
++
++void vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *props)
++{
++    static PFN_vkGetPhysicalDeviceProperties real;
++
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceProperties)_android_vulkan_dlsym("vkGetPhysicalDeviceProperties");
++    real(physicalDevice, props);
++    hybris_cap_api_version(props);
++}
+ VULKAN_IDLOAD(vkGetPhysicalDeviceQueueFamilyProperties);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceMemoryProperties);
+ 
+@@ -141,6 +159,10 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+         return (PFN_vkVoidFunction)vkCreateInstance;
+     } else if (!strcmp(pName, "vkGetInstanceProcAddr")) {
+         return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
++    } else if (!strcmp(pName, "vkEnumerateDeviceExtensionProperties")) {
++        return (PFN_vkVoidFunction)vkEnumerateDeviceExtensionProperties;
++    } else if (!strcmp(pName, "vkGetPhysicalDeviceProperties")) {
++        return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties;
+     } else if (!strcmp(pName, "vkGetPhysicalDeviceProperties2") ||
+                !strcmp(pName, "vkGetPhysicalDeviceProperties2KHR")) {
+         return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties2;
+@@ -162,7 +184,59 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+ VULKAN_IDLOAD(vkGetDeviceProcAddr);
+ VULKAN_IDLOAD(vkCreateDevice);
+ VULKAN_IDLOAD(vkDestroyDevice);
+-VULKAN_IDLOAD(vkEnumerateDeviceExtensionProperties);
++/* Debug knob for bisecting driver bugs from a layer-less stack (Khronos layers can't sit
++ * on top of an Android loader). HYBRIS_VK_HIDE_EXTS=a,b hides device extensions. */
++static int hybris_ext_hidden(const char *name)
++{
++    const char *list = getenv("HYBRIS_VK_HIDE_EXTS");
++    size_t n = strlen(name);
++
++    for (const char *p = list; p && *p; ) {
++        const char *e = strchr(p, ',');
++        size_t len = e ? (size_t)(e - p) : strlen(p);
++        if (len == n && !strncmp(p, name, n))
++            return 1;
++        p = e ? e + 1 : NULL;
++    }
++    return 0;
++}
++
++VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties)
++{
++    static PFN_vkEnumerateDeviceExtensionProperties real;
++    VkExtensionProperties *all;
++    uint32_t count = 0, kept = 0;
++    VkResult ret;
++
++    if (!real)
++        real = (PFN_vkEnumerateDeviceExtensionProperties)_android_vulkan_dlsym("vkEnumerateDeviceExtensionProperties");
++    if (!getenv("HYBRIS_VK_HIDE_EXTS"))
++        return real(physicalDevice, pLayerName, pPropertyCount, pProperties);
++
++    ret = real(physicalDevice, pLayerName, &count, NULL);
++    if (ret != VK_SUCCESS)
++        return ret;
++    all = calloc(count, sizeof(*all));
++    if (!all)
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    real(physicalDevice, pLayerName, &count, all);
++    for (uint32_t i = 0; i < count; i++) {
++        if (hybris_ext_hidden(all[i].extensionName))
++            continue;
++        if (pProperties && kept < *pPropertyCount)
++            pProperties[kept] = all[i];
++        kept++;
++    }
++    free(all);
++    if (!pProperties) {
++        *pPropertyCount = kept;
++        return VK_SUCCESS;
++    }
++    ret = kept > *pPropertyCount ? VK_INCOMPLETE : VK_SUCCESS;
++    if (kept < *pPropertyCount)
++        *pPropertyCount = kept;
++    return ret;
++}
+ VULKAN_IDLOAD(vkEnumerateInstanceLayerProperties);
+ VULKAN_IDLOAD(vkEnumerateDeviceLayerProperties);
+ VULKAN_IDLOAD(vkGetDeviceQueue);
+@@ -331,6 +405,7 @@ void vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalD
+         real = (PFN_vkGetPhysicalDeviceProperties2)_android_vulkan_dlsym("vkGetPhysicalDeviceProperties2");
+     real(physicalDevice, props);
+     hybris_fill_drm_props(props);
++    hybris_cap_api_version(&props->properties);
+ }
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties2);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceImageFormatProperties2);
+-- 
+2.55.0
+

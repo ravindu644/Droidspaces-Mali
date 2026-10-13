@@ -1,0 +1,165 @@
+From 1468730bbcb347797363e94400c78bc4272dd5a7 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:29 +0530
+Subject: [PATCH 20/22] hybris: wayland_window_common: orphan buffers on API
+ disconnect
+
+Android's swapchain disconnects and reconnects the window before dequeueing
+a new swapchain's images, and BufferQueue orphans every buffer then. We
+kept them, so a buffer the compositor released after a recreate came back,
+the swapchain returned OUT_OF_DATE, and Zink recreated it forever: a popup
+spun a driver thread and froze plasmashell. Free idle buffers on disconnect
+and free held ones once released or cancelled. This replaces counting held
+buffers into the budget.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/egl/platforms/wayland/wayland_window.h |  4 ++
+ hybris/platforms/common/nativewindowbase.cpp  |  1 +
+ hybris/platforms/common/nativewindowbase.h    |  1 +
+ .../wayland/wayland_window_common.cpp         | 45 +++++++++++++++++++
+ .../vulkan/platforms/wayland/wayland_window.h |  4 ++
+ 5 files changed, 55 insertions(+)
+
+diff --git a/hybris/egl/platforms/wayland/wayland_window.h b/hybris/egl/platforms/wayland/wayland_window.h
+index a17450f..2cc914a 100644
+--- a/hybris/egl/platforms/wayland/wayland_window.h
++++ b/hybris/egl/platforms/wayland/wayland_window.h
+@@ -84,6 +84,7 @@ protected:
+     virtual int setBuffersFormat(int format);
+     virtual int setBuffersDimensions(int width, int height);
+     virtual int setBufferCount(int cnt);
++    virtual void apiDisconnect();
+ 
+ private:
+     WaylandNativeWindowBuffer *addBuffer();
+@@ -93,6 +94,9 @@ private:
+ 
+     std::list<WaylandNativeWindowBuffer *> m_bufList;
+     std::list<WaylandNativeWindowBuffer *> fronted;
++    /* Buffers from before the last disconnect that are still dequeued or on screen */
++    std::list<WaylandNativeWindowBuffer *> m_orphans;
++    bool reapOrphan(WaylandNativeWindowBuffer *wnb);
+     std::deque<WaylandNativeWindowBuffer *> queue;
+     struct wl_egl_window *m_window;
+     struct wl_display *m_display;
+diff --git a/hybris/platforms/common/nativewindowbase.cpp b/hybris/platforms/common/nativewindowbase.cpp
+index 3c2497f..e6bafd6 100644
+--- a/hybris/platforms/common/nativewindowbase.cpp
++++ b/hybris/platforms/common/nativewindowbase.cpp
+@@ -431,6 +431,7 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
+ 		break;
+ 	case NATIVE_WINDOW_API_DISCONNECT            : // 14,   /* private */
+ 		TRACE("api disconnect");
++		self->apiDisconnect();
+ 		break;
+ #if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=1 || ANDROID_VERSION_MAJOR>=5
+ 	case NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS : // 15, /* private */
+diff --git a/hybris/platforms/common/nativewindowbase.h b/hybris/platforms/common/nativewindowbase.h
+index c931e92..93e128f 100644
+--- a/hybris/platforms/common/nativewindowbase.h
++++ b/hybris/platforms/common/nativewindowbase.h
+@@ -91,6 +91,7 @@ protected:
+ 	virtual int setBuffersDimensions(int width, int height) = 0;
+ 	virtual int setUsage(uint64_t usage) = 0;
+ 	virtual int setBufferCount(int cnt) = 0;
++	virtual void apiDisconnect() {}
+ private:
+ 	static int _setSwapInterval(struct ANativeWindow* window, int interval);
+ 	static int _dequeueBuffer_DEPRECATED(ANativeWindow* window, ANativeWindowBuffer** buffer);
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index a27c743..b9ea3a8 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -302,6 +302,8 @@ void WaylandNativeWindow::releaseBuffer(struct wl_buffer *buffer)
+     WaylandNativeWindowBuffer* wnb = *it;
+     fronted.erase(it);
+     HYBRIS_TRACE_COUNTER("wayland-platform", "fronted.size", "%lu", fronted.size());
++    if (reapOrphan(wnb))
++        return;
+ 
+     for (it = m_bufList.begin(); it != m_bufList.end(); ++it)
+     {
+@@ -374,6 +376,10 @@ int WaylandNativeWindow::cancelBuffer(BaseNativeWindowBuffer* buffer, int fenceF
+ 
+     lock();
+     HYBRIS_TRACE_BEGIN("wayland-platform", "cancelBuffer", "-%p", wnb);
++    if (reapOrphan(wnb)) {
++        unlock();
++        return 0;
++    }
+ 
+     /* Check first that it really is our buffer */
+     for (it = m_bufList.begin(); it != m_bufList.end(); ++it)
+@@ -505,7 +511,46 @@ void WaylandNativeWindow::destroyBuffers()
+         destroyBuffer(*it);
+     }
+     m_bufList.clear();
++    for (it = m_orphans.begin(); it != m_orphans.end(); ++it)
++        destroyBuffer(*it);
++    m_orphans.clear();
++    m_freeBufs = 0;
++}
++
++/* Android's swapchain disconnects and reconnects the window before it dequeues a
++ * new swapchain's images, and BufferQueue orphans every buffer on disconnect. We
++ * kept them, so a buffer the compositor released after a recreate came back from
++ * dequeueBuffer, the swapchain didn't know it ("dequeueBuffer returned unrecognized
++ * buffer"), returned OUT_OF_DATE, and Zink recreated it forever: plasmashell's
++ * launcher popup spun a driver thread at 100% and froze the whole shell. */
++void WaylandNativeWindow::apiDisconnect()
++{
++    lock();
++    std::list<WaylandNativeWindowBuffer*>::iterator it = m_bufList.begin();
++    for (; it != m_bufList.end(); ++it) {
++        if ((*it)->busy)
++            m_orphans.push_back(*it);
++        else
++            destroyBuffer(*it);
++    }
++    m_bufList.clear();
+     m_freeBufs = 0;
++    unlock();
++}
++
++/* Frees a buffer orphaned by apiDisconnect() once the client or compositor lets go */
++bool WaylandNativeWindow::reapOrphan(WaylandNativeWindowBuffer *wnb)
++{
++    std::list<WaylandNativeWindowBuffer*>::iterator it = m_orphans.begin();
++    for (; it != m_orphans.end(); ++it) {
++        if (*it == wnb) {
++            m_orphans.erase(it);
++            ++m_freeBufs; /* destroyBuffer() assumes it was a free buffer */
++            destroyBuffer(wnb);
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ WaylandNativeWindowBuffer *WaylandNativeWindow::addBuffer() {
+diff --git a/hybris/vulkan/platforms/wayland/wayland_window.h b/hybris/vulkan/platforms/wayland/wayland_window.h
+index e0dca6a..be9c3ac 100644
+--- a/hybris/vulkan/platforms/wayland/wayland_window.h
++++ b/hybris/vulkan/platforms/wayland/wayland_window.h
+@@ -80,6 +80,7 @@ protected:
+     virtual int setBuffersFormat(int format);
+     virtual int setBuffersDimensions(int width, int height);
+     virtual int setBufferCount(int cnt);
++    virtual void apiDisconnect();
+ 
+ private:
+     WaylandNativeWindowBuffer *addBuffer();
+@@ -90,6 +91,9 @@ private:
+ 
+     std::list<WaylandNativeWindowBuffer *> m_bufList;
+     std::list<WaylandNativeWindowBuffer *> fronted;
++    /* Buffers from before the last disconnect that are still dequeued or on screen */
++    std::list<WaylandNativeWindowBuffer *> m_orphans;
++    bool reapOrphan(WaylandNativeWindowBuffer *wnb);
+     struct wl_egl_window *m_window;
+     struct wl_display *m_display;
+     int m_width;
+-- 
+2.55.0
+

@@ -1,0 +1,29 @@
+[Unit]
+Description=KDE Plasma for %i on the Mali GPU, shown through Anland
+After=systemd-user-sessions.service systemd-logind.service dbus.service
+Wants=systemd-logind.service
+
+[Service]
+User=%i
+# A real logind session: /run/user/<uid>, a seat, polkit
+PAMName=login
+Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_CLASS=user XDG_SEAT=seat0
+Environment=ANLAND=1 ANLAND_SOCKET=/run/display.sock QT_QPA_PLATFORM=wayland
+# /opt/hy/bin first, so kwin_wayland_wrapper starts our KWin wrapper
+Environment=PATH=/opt/hy/bin:/usr/local/bin:/usr/bin:/bin
+# Every Wayland client renders through zink on the Mali; KWin swaps in its own setup
+EnvironmentFile=/opt/hy/etc/mali-gpu.env
+# Droidspaces binds the Anland socket in when the container starts
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S /run/display.sock ] && exit 0; sleep 1; done; echo "no /run/display.sock" >&2; exit 1'
+# As root (+): a copy of KWin without its file capability, refreshed after a KWin upgrade.
+# install copies the contents only, so the capability stays behind. See /opt/hy/bin/kwin_wayland.
+ExecStartPre=+/bin/sh -c '[ /opt/hy/libexec/kwin_wayland -nt /usr/bin/kwin_wayland ] || install -Dm755 /usr/bin/kwin_wayland /opt/hy/libexec/kwin_wayland'
+ExecStart=/usr/bin/dbus-run-session /usr/bin/startplasma-wayland
+# pam_systemd moves the session into its own scope, outside this service, so a stop alone
+# leaves KWin running and the next start fails. End the user's sessions on every stop.
+ExecStopPost=-/usr/bin/loginctl terminate-user %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

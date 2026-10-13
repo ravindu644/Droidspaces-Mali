@@ -1,0 +1,147 @@
+From dfc841e04e4c0f5570f0792dae1a37960734af72 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:30 +0530
+Subject: [PATCH 22/22] hybris: vulkan: add HYBRIS_VK_HIDE_FEATURES
+
+Zink builds its own geometry shaders to emulate GL quads, line stipple and
+the GL provoking vertex. The Mali compiler builds application geometry
+shaders fine but crashes in vkCreateGraphicsPipelines on Zink's.
+HYBRIS_VK_HIDE_FEATURES=geometryShader makes Zink split quads on the CPU.
+The list parser is shared with HYBRIS_VK_HIDE_EXTS.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/vulkan/vulkan.c | 67 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 763cadf..be04978 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -94,7 +94,7 @@ VkResult vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAlloc
+ 
+ VULKAN_IDLOAD(vkDestroyInstance);
+ VULKAN_IDLOAD(vkEnumeratePhysicalDevices);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceFeatures);
++/* vkGetPhysicalDeviceFeatures: feature hiding */
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceImageFormatProperties);
+ static void hybris_cap_api_version(VkPhysicalDeviceProperties *props)
+@@ -151,6 +151,7 @@ VULKAN_IDLOAD(vkDestroySurfaceKHR);
+ #endif
+ 
+ static PFN_vkVoidFunction hybris_dmabuf_hook(const char *pName);
++static PFN_vkVoidFunction hybris_features_hook(const char *pName);
+ 
+ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+ {
+@@ -183,6 +184,8 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+ #endif
+     } else {
+         PFN_vkVoidFunction hook = hybris_dmabuf_hook(pName);
++        if (!hook)
++            hook = hybris_features_hook(pName);
+         if (hook)
+             return hook;
+     }
+@@ -214,9 +217,9 @@ VULKAN_IDLOAD(vkCreateDevice);
+ VULKAN_IDLOAD(vkDestroyDevice);
+ /* Debug knob for bisecting driver bugs from a layer-less stack (Khronos layers can't sit
+  * on top of an Android loader). HYBRIS_VK_HIDE_EXTS=a,b hides device extensions. */
+-static int hybris_ext_hidden(const char *name)
++/* Is name an entry of the comma-separated list? */
++static int hybris_in_list(const char *list, const char *name)
+ {
+-    const char *list = getenv("HYBRIS_VK_HIDE_EXTS");
+     size_t n = strlen(name);
+ 
+     for (const char *p = list; p && *p; ) {
+@@ -229,6 +232,11 @@ static int hybris_ext_hidden(const char *name)
+     return 0;
+ }
+ 
++static int hybris_ext_hidden(const char *name)
++{
++    return hybris_in_list(getenv("HYBRIS_VK_HIDE_EXTS"), name);
++}
++
+ VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char *pLayerName, uint32_t *pPropertyCount, VkExtensionProperties *pProperties)
+ {
+     static PFN_vkEnumerateDeviceExtensionProperties real;
+@@ -397,7 +405,7 @@ VULKAN_IDLOAD(vkEnumeratePhysicalDeviceGroups);
+ VULKAN_IDLOAD(vkGetImageMemoryRequirements2);
+ VULKAN_IDLOAD(vkGetBufferMemoryRequirements2);
+ VULKAN_IDLOAD(vkGetImageSparseMemoryRequirements2);
+-VULKAN_IDLOAD(vkGetPhysicalDeviceFeatures2);
++/* vkGetPhysicalDeviceFeatures2: feature hiding */
+ /* An Android driver has no DRM device, so it leaves VkPhysicalDeviceDrmPropertiesEXT
+  * zeroed. Mesa's zink picks its Vulkan device by matching those numbers against the
+  * DRM fd the compositor advertised, so on a phone with only a display node it never
+@@ -566,7 +574,7 @@ VULKAN_IDLOAD(vkCmdDecodeVideoKHR);
+ VULKAN_IDLOAD(vkCmdBeginRenderingKHR);
+ VULKAN_IDLOAD(vkCmdEndRenderingKHR);
+ #endif
+-VULKAN_IDLOAD(vkGetPhysicalDeviceFeatures2KHR);
++/* vkGetPhysicalDeviceFeatures2KHR: feature hiding */
+ VULKAN_IDLOAD(vkGetPhysicalDeviceProperties2KHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceFormatProperties2KHR);
+ /* vkGetPhysicalDeviceImageFormatProperties2KHR: dma-buf export emulation */
+@@ -881,6 +889,55 @@ static PFN_vkVoidFunction hybris_dmabuf_hook(const char *pName)
+     return NULL;
+ }
+ /* end of dma-buf export emulation */
++
++/* Feature hiding (HYBRIS_VK_HIDE_FEATURES=a,b), the feature twin of HYBRIS_VK_HIDE_EXTS.
++ *
++ * geometryShader: zink builds its own geometry shaders to emulate GL quads, line stipple,
++ * edge flags and the GL provoking vertex. The Mali blob compiles application geometry
++ * shaders fine (probes/vkgsprobe.c) but crashes inside vkCreateGraphicsPipelines on
++ * zink's (glxgears: GL_QUADS). Without the feature zink splits quads on the CPU instead.
++ * ponytail: only the features we have needed to hide are known by name. */
++static void hybris_hide_features(VkPhysicalDeviceFeatures *f)
++{
++    const char *list = getenv("HYBRIS_VK_HIDE_FEATURES");
++    if (hybris_in_list(list, "geometryShader"))
++        f->geometryShader = VK_FALSE;
++}
++
++void vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures)
++{
++    static PFN_vkGetPhysicalDeviceFeatures real;
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceFeatures)_android_vulkan_dlsym("vkGetPhysicalDeviceFeatures");
++    real(physicalDevice, pFeatures);
++    hybris_hide_features(pFeatures);
++}
++
++void vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
++{
++    static PFN_vkGetPhysicalDeviceFeatures2 real;
++    if (!real)
++        real = (PFN_vkGetPhysicalDeviceFeatures2)_android_vulkan_dlsym("vkGetPhysicalDeviceFeatures2");
++    real(physicalDevice, pFeatures);
++    hybris_hide_features(&pFeatures->features);
++}
++
++void vkGetPhysicalDeviceFeatures2KHR(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
++{
++    vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
++}
++
++static PFN_vkVoidFunction hybris_features_hook(const char *pName)
++{
++    if (!strcmp(pName, "vkGetPhysicalDeviceFeatures"))
++        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures;
++    if (!strcmp(pName, "vkGetPhysicalDeviceFeatures2"))
++        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures2;
++    if (!strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR"))
++        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures2KHR;
++    return NULL;
++}
++/* end of feature hiding */
+ VULKAN_IDLOAD(vkGetMemoryFdPropertiesKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceExternalSemaphorePropertiesKHR);
+ VULKAN_IDLOAD(vkImportSemaphoreFdKHR);
+-- 
+2.55.0
+

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Escape hatch: run one app on Mesa's software renderer inside the Mali session.
+exec env -u LD_LIBRARY_PATH -u LD_PRELOAD -u MESA_LOADER_DRIVER_OVERRIDE \
+    -u HYBRIS_VK_DRM_NODE -u HYBRIS_VK_HIDE_EXTS "$@"

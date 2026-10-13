@@ -1,0 +1,55 @@
+From c80faa680ebd09873868d6c267f1c1a015f8e46f Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:27 +0530
+Subject: [PATCH 08/22] hybris: wayland_window_common: pick the largest dma-buf
+ in a gralloc handle
+
+MediaTek gralloc4 handles carry [gralloc_extra (no size), the pixel
+dma-buf, gralloc_shared_memory]. Taking the first fd that is big enough
+picked the metadata fd on 1x1 buffers.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../wayland/wayland_window_common.cpp         | 22 +++++++++++--------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index 9151b0e..c0c69f1 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -737,19 +737,23 @@ void DrmWaylandBuffer::init(
+         abort();
+     }
+ 
+-    /* Standard linux-dmabuf: one plane, the handle's dma-buf. Lindroid's compositor
+-     * took every handle fd plus a memfd describing the native_handle; KWin and other
+-     * stock compositors reject that as an unknown multi-plane buffer. MediaTek gralloc
+-     * puts a gralloc_extra metadata fd first, so pick the fd that reports a size big
+-     * enough for the pixels (only a dma-buf answers lseek(SEEK_END)). */
++    /* Standard linux-dmabuf: one plane, the handle's pixel dma-buf. Lindroid's
++     * compositor took every handle fd plus a memfd describing the native_handle; KWin
++     * and other stock compositors reject that as an unknown multi-plane buffer.
++     * MediaTek gralloc also carries a gralloc_extra fd (no size) and a small metadata
++     * dma-buf, which beats a "big enough" test on tiny buffers such as vkcube's first
++     * 1x1 one. Only dma-bufs answer lseek(SEEK_END), and the pixels are the largest. */
+     int pixel_fd = -1;
+-    for (int i = 0; i < nh->numFds && pixel_fd < 0; i++) {
++    off_t best = 0;
++    for (int i = 0; i < nh->numFds; i++) {
+         off_t size = lseek(nh->data[i], 0, SEEK_END);
+-        if (size >= (off_t)stride * 4 * height)
++        if (size > best) {
++            best = size;
+             pixel_fd = nh->data[i];
++        }
+     }
+-    if (pixel_fd < 0) {
+-        fprintf(stderr, "hybris: no dma-buf among the %d fds of the gralloc handle\n", nh->numFds);
++    if (pixel_fd < 0 || best < (off_t)stride * 4 * height) {
++        fprintf(stderr, "hybris: no pixel dma-buf among the %d fds of the gralloc handle\n", nh->numFds);
+         abort();
+     }
+     zwp_linux_buffer_params_v1_add(params, pixel_fd, 0, 0, stride * 4, 0, 0);
+-- 
+2.55.0
+

@@ -1,0 +1,160 @@
+From 402e6d58ad356c03e2dae367095e96c510dd0396 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:22 +0530
+Subject: [PATCH 01/22] hybris: common: patch stock bionic's own TLS reads to a
+ fake TCB
+
+Android 14's libc++ calls bionic functions such as __ctype_get_mb_cur_max
+that read tpidr_el0 slots bionic owns (slot 1, pthread_internal_t, and slot
+-1, bionic_tls). Under a glibc process those slots belong to glibc, so the
+reads hit NULL+0x820 and the first stock Android library crashed. The
+existing patcher only rewrote the GL slots 3 and 4.
+
+Rewrite every `mrs xN, tpidr_el0` in libc.so, libm.so and libdl.so into an
+adrp to a two-page fake TCB within adrp range: slot 1 points at a zeroed
+fake pthread_internal_t, slot -1 at a zeroed fake bionic_tls. The bionic
+part is always installed on aarch64; the GL slot part stays behind
+HYBRIS_PATCH_TLS.
+
+Limit: one fake thread is shared by every thread, so bionic-internal scratch
+state races. errno is read through the hooked __errno, so only unread
+values are lost.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/common/hooks.c                      |  4 +-
+ hybris/common/tls_patcher.c                | 10 +++
+ hybris/common/tls_patcher_bionic_aarch64.c | 78 ++++++++++++++++++++++
+ 3 files changed, 90 insertions(+), 2 deletions(-)
+ create mode 100644 hybris/common/tls_patcher_bionic_aarch64.c
+
+diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
+index e55cf7d..9b786e0 100644
+--- a/hybris/common/hooks.c
++++ b/hybris/common/hooks.c
+@@ -3645,8 +3645,8 @@ static void __hybris_linker_init()
+ 
+     hybris_tls_patcher_t tls_patcher = NULL;
+ #ifdef __aarch64__
+-    if (getenv("HYBRIS_PATCH_TLS") != NULL)
+-        tls_patcher = hybris_patch_tls;
++    /* always on: stock bionic needs its TCB reads redirected, see tls_patcher_bionic_aarch64.c */
++    tls_patcher = hybris_patch_tls;
+ #endif
+ 
+     /* Now its time to setup the linker itself */
+diff --git a/hybris/common/tls_patcher.c b/hybris/common/tls_patcher.c
+index 1c51e8b..20eb2ff 100644
+--- a/hybris/common/tls_patcher.c
++++ b/hybris/common/tls_patcher.c
+@@ -27,6 +27,10 @@ extern void* _hybris_hook___get_tls_hooks(void);
+ /* Architecture-specific patch function */
+ extern void hybris_patch_tls_arch(void* segment_addr, size_t segment_size, int tls_offset);
+ 
++#ifdef __aarch64__
++#include "tls_patcher_bionic_aarch64.c"
++#endif
++
+ /* Calculate offset from thread pointer to our TLS area */
+ static int hybris_calculate_tls_offset(void) {
+     void* tp = __builtin_thread_pointer();
+@@ -81,6 +85,12 @@ static int should_patch_library(const char* library_name) {
+ }
+ 
+ void hybris_patch_tls(void* segment_addr, size_t segment_size, const char* library_name) {
++#ifdef __aarch64__
++    if (is_bionic(get_basename(library_name))) {
++        hybris_patch_bionic_tp(segment_addr, segment_size, get_basename(library_name));
++        return;
++    }
++#endif
+     if (!should_patch_library(library_name)) {
+         return;
+     }
+diff --git a/hybris/common/tls_patcher_bionic_aarch64.c b/hybris/common/tls_patcher_bionic_aarch64.c
+new file mode 100644
+index 0000000..524c8b2
+--- /dev/null
++++ b/hybris/common/tls_patcher_bionic_aarch64.c
+@@ -0,0 +1,78 @@
++/*
++ * Stock bionic reads its own thread state through tpidr_el0: slot 1 is
++ * pthread_internal_t (errno lives there) and slot -1 is bionic_tls (locale,
++ * strerror buffers). Under glibc those words belong to glibc, so any bionic
++ * function hybris does not hook crashes the first time it touches them, for
++ * example __ctype_get_mb_cur_max from Android 14's libc++. Halium never hit
++ * this because it ships a bionic built with hybris patches; we run the
++ * device's stock /system.
++ *
++ * Fix: inside bionic itself, turn every "mrs xN, tpidr_el0" into
++ * "adrp xN, fake_tcb", a page whose slot 1 and slot -1 point at zeroed
++ * stand-ins. Everything else bionic reads from its TCB sees zeros.
++ *
++ * ponytail: one fake thread shared by every thread, so bionic-internal errno
++ * and scratch buffers race between threads. Callers read errno through the
++ * hooked __errno (glibc), so the race only loses values nobody reads. Per
++ * thread state needs a slot in hybris static TLS, do that if a blob ever
++ * depends on bionic_tls contents.
++ */
++#include <stdint.h>
++#include <string.h>
++#include <sys/mman.h>
++
++#define BIONIC_FAKE_SIZE (64 * 1024)
++
++static uint8_t bionic_fake_thread[BIONIC_FAKE_SIZE] __attribute__((aligned(64)));
++static uint8_t bionic_fake_tls[BIONIC_FAKE_SIZE] __attribute__((aligned(64)));
++
++/* Two pages, fake TCB at the start of the second, so slot -1 is the last word
++ * of the first. adrp reaches only +-4 GiB, so map it near the library. */
++static uintptr_t bionic_fake_tcb_near(uintptr_t pc)
++{
++    const uintptr_t span = 1UL << 31;
++    for (uintptr_t hint = pc > span ? pc - span : 0x10000; hint < pc + span; hint += span / 8) {
++        uint8_t *p = mmap((void *)hint, 2 * 4096, PROT_READ | PROT_WRITE,
++                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (p == MAP_FAILED)
++            continue;
++        uintptr_t tcb = (uintptr_t)p + 4096;
++        intptr_t d = (intptr_t)(tcb >> 12) - (intptr_t)(pc >> 12);
++        if (d >= -(1L << 20) && d < (1L << 20)) {
++            ((void **)tcb)[-1] = bionic_fake_tls;
++            ((void **)tcb)[1] = bionic_fake_thread;
++            return tcb;
++        }
++        munmap(p, 2 * 4096);
++    }
++    return 0;
++}
++
++static int is_bionic(const char *name)
++{
++    return !strcmp(name, "libc.so") || !strcmp(name, "libm.so") || !strcmp(name, "libdl.so");
++}
++
++static void hybris_patch_bionic_tp(void *segment_addr, size_t segment_size, const char *name)
++{
++    uint32_t *text = segment_addr;
++    size_t count = segment_size / 4, patched = 0;
++    uintptr_t tcb = bionic_fake_tcb_near((uintptr_t)segment_addr);
++
++    if (!tcb) {
++        HYBRIS_ERROR_LOG(HOOKS, "no fake TCB within adrp range of %s, bionic TLS left unpatched", name);
++        return;
++    }
++    for (size_t i = 0; i < count; i++) {
++        /* mrs xN, tpidr_el0 is 0xd53bd040 | N */
++        if ((text[i] & ~0x1fu) != 0xd53bd040u)
++            continue;
++        uintptr_t pc = (uintptr_t)&text[i];
++        int64_t imm = (int64_t)(tcb >> 12) - (int64_t)(pc >> 12);
++        text[i] = 0x90000000u | ((uint32_t)(imm & 3) << 29) |
++                  ((uint32_t)((imm >> 2) & 0x7ffff) << 5) | (text[i] & 0x1f);
++        patched++;
++    }
++    __builtin___clear_cache((char *)segment_addr, (char *)segment_addr + segment_size);
++    HYBRIS_DEBUG_LOG(HOOKS, "redirected %zu tpidr_el0 reads in %s to fake TCB %p", patched, name, (void *)tcb);
++}
+-- 
+2.55.0
+

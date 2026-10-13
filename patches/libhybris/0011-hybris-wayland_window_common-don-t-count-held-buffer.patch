@@ -1,0 +1,36 @@
+From ba957f4c43c09af906e73fb8a0ced631c5f5c7de Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:27 +0530
+Subject: [PATCH 11/22] hybris: wayland_window_common: don't count held buffers
+ against the budget
+
+Android's swapchain dequeues every image when it is created. On recreation
+one image was still held by the compositor, which only releases it after a
+newer commit, so vkCreateSwapchainKHR deadlocked in dequeueBuffer.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/platforms/wayland/wayland_window_common.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index c0c69f1..c3863fe 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -529,6 +529,13 @@ WaylandNativeWindowBuffer *WaylandNativeWindow::addBuffer() {
+ int WaylandNativeWindow::setBufferCount(int cnt) {
+     TRACE("cnt:%d", cnt);
+ 
++    /* Buffers the compositor still holds don't count against the client's budget.
++     * Android's swapchain dequeues every image while it is being created; when a
++     * swapchain is recreated (a resize, the first configure) one image is still on
++     * screen, and the compositor only releases it after a newer commit that can
++     * never come, so vkCreateSwapchainKHR deadlocked in dequeueBuffer. */
++    cnt += (int)fronted.size();
++
+     if ((int)m_bufList.size() == cnt)
+         return NO_ERROR;
+ 
+-- 
+2.55.0
+

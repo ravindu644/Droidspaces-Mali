@@ -1,0 +1,37 @@
+From 17e5fd85c3d59d1084f0253efb5b58629e9982cb Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:28 +0530
+Subject: [PATCH 17/22] hybris: vulkan: catch swapchains created through
+ vkGetDeviceProcAddr too
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/vulkan/vulkan.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/hybris/vulkan/vulkan.c b/hybris/vulkan/vulkan.c
+index 9177f6f..d511b2f 100644
+--- a/hybris/vulkan/vulkan.c
++++ b/hybris/vulkan/vulkan.c
+@@ -181,6 +181,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
+     return (*_vkGetInstanceProcAddr)(instance, pName);
+ }
+ 
++static PFN_vkCreateSwapchainKHR hybris_real_create_swapchain;
++VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain);
++
+ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice device, const char *pName)
+ {
+     static PFN_vkGetDeviceProcAddr real;
+@@ -506,8 +509,6 @@ VkResult vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevi
+ }
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfaceFormatsKHR);
+ VULKAN_IDLOAD(vkGetPhysicalDeviceSurfacePresentModesKHR);
+-static PFN_vkCreateSwapchainKHR hybris_real_create_swapchain;
+-
+ VkResult vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
+ {
+     if (!hybris_real_create_swapchain)
+-- 
+2.55.0
+

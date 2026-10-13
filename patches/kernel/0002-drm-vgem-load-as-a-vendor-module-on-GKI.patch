@@ -1,0 +1,63 @@
+From 16100a9645db1c085f431c11dbc69de648d7b22b Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Tue, 13 Oct 2026 21:05:13 +0530
+Subject: [PATCH 2/2] drm/vgem: load as a vendor module on GKI
+
+Built as a module against this GKI kernel, vgem imports two symbols the
+kernel does not export to vendor modules: drm_clflush_pages() and
+vma_set_file(). The module then fails to load with "Unknown symbol".
+
+drm_clflush_pages() only flushes on x86 and powerpc. On arm64 it prints
+"Architecture has no drm_cache.c support" and warns, so skip the call
+there. Open code vma_set_file() with get_file() and fput(), which are
+exported.
+
+Used by the libhybris Mali desktop work to give containers a DRM render
+node (/dev/dri/renderD128).
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ kernel-5.15/drivers/gpu/drm/vgem/vgem_drv.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/kernel-5.15/drivers/gpu/drm/vgem/vgem_drv.c b/kernel-5.15/drivers/gpu/drm/vgem/vgem_drv.c
+index bf38a7e31..1d261c46d 100644
+--- a/kernel-5.15/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/kernel-5.15/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -299,7 +299,7 @@ static void vgem_unpin_pages(struct drm_vgem_gem_object *bo)
+ static int vgem_prime_pin(struct drm_gem_object *obj)
+ {
+ 	struct drm_vgem_gem_object *bo = to_vgem_bo(obj);
+-	long n_pages = obj->size >> PAGE_SHIFT;
++	long n_pages __maybe_unused = obj->size >> PAGE_SHIFT;
+ 	struct page **pages;
+ 
+ 	pages = vgem_pin_pages(bo);
+@@ -308,8 +308,12 @@ static int vgem_prime_pin(struct drm_gem_object *obj)
+ 
+ 	/* Flush the object from the CPU cache so that importers can rely
+ 	 * on coherent indirect access via the exported dma-address.
++	 * drm_clflush_pages() only does that on x86 and powerpc, elsewhere it
++	 * just warns, and GKI does not export it to vendor modules.
+ 	 */
++#if defined(CONFIG_X86) || defined(__powerpc__)
+ 	drm_clflush_pages(pages, n_pages);
++#endif
+ 
+ 	return 0;
+ }
+@@ -402,7 +406,10 @@ static int vgem_prime_mmap(struct drm_gem_object *obj,
+ 	if (ret)
+ 		return ret;
+ 
+-	vma_set_file(vma, obj->filp);
++	/* vma_set_file(), open coded: GKI does not export it to vendor modules */
++	get_file(obj->filp);
++	fput(vma->vm_file);
++	vma->vm_file = obj->filp;
+ 	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+ 	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 
+-- 
+2.55.0
+

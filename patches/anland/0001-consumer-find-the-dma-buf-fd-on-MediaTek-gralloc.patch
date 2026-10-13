@@ -1,0 +1,58 @@
+From 9be37df1b303469aac3027554c27798cc6e27d34 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Tue, 13 Oct 2026 16:27:27 +0530
+Subject: [PATCH 1/3] consumer: find the dma-buf fd on MediaTek gralloc
+
+collect_dmabufs() handed the producer anb->handle->data[0] as the
+buffer's dma-buf. That holds for Qualcomm gralloc, but MediaTek's
+gralloc4 puts its gralloc_extra metadata handle
+(anon_inode:gralloc_extra) first and the pixel dma-buf after it. The
+producer then imports a non-dma-buf fd and fails: kbase rejects it with
+ENOMEM and eglCreateImageKHR returns EGL_BAD_ALLOC.
+
+Take the first fd of the native handle that reports a size large enough
+for the pixels instead. Only a dma-buf answers lseek(SEEK_END) with a
+size, so on Qualcomm this still picks data[0].
+
+Tested on a Galaxy A16 5G (SM-A166P, Dimensity 6100+, Mali-G57 MC2):
+the six 1080x2160 buffers now arrive as
+/dmabuf:G:SurfaceView[com.anland.consum...] and a producer renders into
+them at 60 fps.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../app/src/main/jni/native_consumer.c          | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/consumers/anland_v5/android_consumer/app/src/main/jni/native_consumer.c b/consumers/anland_v5/android_consumer/app/src/main/jni/native_consumer.c
+index 0f76298..904fba6 100644
+--- a/consumers/anland_v5/android_consumer/app/src/main/jni/native_consumer.c
++++ b/consumers/anland_v5/android_consumer/app/src/main/jni/native_consumer.c
+@@ -156,8 +156,23 @@ static int collect_dmabufs(struct consumer_state *s)
+             continue;
+         }
+ 
+-        int fd = anb->handle->data[0];   /* first fd backs the dma-buf */
+         int stride = anb->stride, width = anb->width, height = anb->height;
++        /* Qualcomm gralloc puts the pixel dma-buf first, MediaTek puts its
++         * gralloc_extra metadata handle there and the dma-buf later. Only a
++         * dma-buf reports a size, so take the first fd large enough to hold
++         * the pixels. */
++        int fd = -1;
++        for (int k = 0; k < anb->handle->numFds && fd < 0; k++) {
++            off_t size = lseek(anb->handle->data[k], 0, SEEK_END);
++            if (size >= (off_t)stride * 4 * height)
++                fd = anb->handle->data[k];
++        }
++        if (fd < 0) {
++            LOGE("no dma-buf among the %d fds of the buffer on attempt %d",
++                 anb->handle->numFds, attempt);
++            api.cancelBuffer(win, anb, -1);
++            continue;
++        }
+ 
+         /* deduplicate by ANativeWindowBuffer pointer (stable per queue slot) */
+         bool dup_found = false;
+-- 
+2.55.0
+

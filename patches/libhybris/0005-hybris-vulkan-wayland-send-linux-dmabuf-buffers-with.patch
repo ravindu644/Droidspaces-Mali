@@ -1,0 +1,93 @@
+From 27548d599b960dc815886a6c58929256aa2d198f Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:03:26 +0530
+Subject: [PATCH 05/22] hybris: vulkan: wayland: send linux-dmabuf buffers
+ without android_wlegl
+
+KWin 6 and every Mesa-based compositor have no android_wlegl, so the
+Vulkan Wayland platform aborted. Compile DrmWaylandBuffer into the Vulkan
+plugin and present through zwp_linux_dmabuf_v1 with one standard plane when
+android_wlegl is missing.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ .../wayland/wayland_window_common.cpp         | 39 +++++++------------
+ .../wayland/vulkanplatform_wayland.cpp        |  9 +++--
+ 2 files changed, 18 insertions(+), 30 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index 99d5fba..7cb96ed 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -734,35 +734,22 @@ void DrmWaylandBuffer::init(
+         abort();
+     }
+ 
+-    for (int i = 0; i < nh->numFds; i++)
+-        zwp_linux_buffer_params_v1_add(params, nh->data[i], i, 0, stride * 4, 0, 0);
+-
+-    size_t buffer_size = sizeof(int) * (4 + nh->numInts);
+-    std::vector<int> buffer(4 + nh->numInts);
+-
+-    buffer[0] = -1;
+-    buffer[1] = nh->version;
+-    buffer[2] = nh->numFds;
+-    buffer[3] = nh->numInts;
+-
+-    for (int i = 0; i < nh->numInts; i++)
+-        buffer[4 + i] = nh->data[nh->numFds + i];
+-
+-    int meta_fd = memfd_create("lindroid-meta", MFD_CLOEXEC);
+-    if (ftruncate(meta_fd, buffer_size) != 0) {
+-        fprintf(stderr, "lindroid-drm: ftruncate failed\n");
+-        close(meta_fd);
+-        abort();
++    /* Standard linux-dmabuf: one plane, the handle's dma-buf. Lindroid's compositor
++     * took every handle fd plus a memfd describing the native_handle; KWin and other
++     * stock compositors reject that as an unknown multi-plane buffer. MediaTek gralloc
++     * puts a gralloc_extra metadata fd first, so pick the fd that reports a size big
++     * enough for the pixels (only a dma-buf answers lseek(SEEK_END)). */
++    int pixel_fd = -1;
++    for (int i = 0; i < nh->numFds && pixel_fd < 0; i++) {
++        off_t size = lseek(nh->data[i], 0, SEEK_END);
++        if (size >= (off_t)stride * 4 * height)
++            pixel_fd = nh->data[i];
+     }
+-
+-    if (pwrite(meta_fd, buffer.data(), buffer_size, 0) != (ssize_t)buffer_size) {
+-        fprintf(stderr, "lindroid-drm: failed to write data into meta_fd\n");
+-        close(meta_fd);
++    if (pixel_fd < 0) {
++        fprintf(stderr, "hybris: no dma-buf among the %d fds of the gralloc handle\n", nh->numFds);
+         abort();
+     }
+-
+-    zwp_linux_buffer_params_v1_add(params, meta_fd, nh->numFds, 0, 1, 0, 0);
+-    close(meta_fd);
++    zwp_linux_buffer_params_v1_add(params, pixel_fd, 0, 0, stride * 4, 0, 0);
+ 
+     uint32_t req_format = (format == HAL_PIXEL_FORMAT_RGBX_8888) ? GBM_FORMAT_XRGB8888 : GBM_FORMAT_ABGR8888;
+     wlbuffer = zwp_linux_buffer_params_v1_create_immed(params, width, height, req_format, 0);
+diff --git a/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp b/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
+index 0808fc6..073781c 100644
+--- a/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
++++ b/hybris/vulkan/platforms/wayland/vulkanplatform_wayland.cpp
+@@ -118,10 +118,11 @@ static void callback_done(void *data, wl_callback *cb, uint32_t d)
+     WaylandDisplay *dpy = (WaylandDisplay *)data;
+ 
+     wl_callback_destroy(cb);
+-    if (!dpy->wlegl) {
+-        fprintf(stderr, "Fatal: the server doesn't advertise the android_wlegl global!");
+-        abort();
+-    }
++    /* Compositors that never call eglBindWaylandDisplayWL (KWin 6, every
++     * Mesa-based one) have no android_wlegl. Windows then send their buffers
++     * through zwp_linux_dmabuf_v1 instead (DrmWaylandBuffer). */
++    if (!dpy->wlegl)
++        fprintf(stderr, "hybris: no android_wlegl, using zwp_linux_dmabuf_v1\n");
+ }
+ 
+ static const wl_callback_listener callback_listener = {
+-- 
+2.55.0
+
