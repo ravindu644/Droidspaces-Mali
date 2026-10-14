@@ -28,7 +28,7 @@ vkcube's swapchain images come from gralloc, and libhybris hands them to KWin as
 | the window was 1x1 and stalled after two frames | Android's swapchain reports the placeholder window size as fixed | patch 10: report "the client chooses" |
 | stall in `dequeueBuffer` after a resize | Android's swapchain dequeues every image at creation, while one was still on screen | patch 11, later replaced by patch 20 |
 | the window showed TV static | gralloc picked a compressed, tiled layout, and KWin read it as linear | patch 12: allocate with `SW_READ_RARELY`, which makes gralloc choose linear |
-| tiny buffers picked the wrong fd | a MediaTek gralloc handle is `[metadata, pixels, shared memory]`, and "large enough" matched the metadata on 1x1 buffers | patch 8: the largest dma-buf in the handle |
+| tiny buffers picked the wrong fd | a MediaTek gralloc handle is `[metadata, pixels, shared memory]`, and "large enough" matched the metadata on 1x1 buffers | patch 8: the largest dma-buf in the handle. Patch 23 later fixed it for buffers of a page or less, see [Fedora 44](11-fedora.md#windows-of-a-page-or-less) |
 | `Failed to load matching allocator for mapper version 4` | SELinux, see below | one rule |
 
 vkcube then spun at about 59 fps.

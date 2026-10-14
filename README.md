@@ -53,12 +53,14 @@ Follow the parts in order.
 
 [The story](story/README.md) is the full log, from the first probe to a daily desktop. It covers every wall we hit, why it happened and how we got past it. Read it before you port this to another phone. Most of the failures will look the same.
 
+Other distributions: a Fedora 44 rootfs got as far as a working desktop, but browsers render wrong on the GPU with current Mesa, so Debian 13 stays the base. [Fedora 44](story/11-fedora.md) has the details.
+
 ## Repository layout
 
 | Path | What |
 |---|---|
 | `patches/kernel/` | Mali kernel driver fix for PID namespaces, vgem as a vendor module |
-| `patches/libhybris/` | 22 patches on Droidian's `feature/next/lindroid-drm` |
+| `patches/libhybris/` | 23 patches on Droidian's `feature/next/lindroid-drm` |
 | `patches/mesa/` | 5 patches on Debian's Mesa 25.0.7 |
 | `patches/anland/` | 3 patches on Anland's `legacy` branch |
 | `shim/` | the gralloc shim on `AHardwareBuffer`, and the header libhybris needs with Android 14 headers |

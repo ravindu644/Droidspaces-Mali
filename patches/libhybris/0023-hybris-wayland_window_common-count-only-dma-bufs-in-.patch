@@ -1,0 +1,59 @@
+From b56db802dcc4ddb6f3e14941572ce372b44872f5 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 16:42:37 +0530
+Subject: [PATCH] hybris: wayland_window_common: count only dma-bufs in a
+ gralloc handle
+
+MediaTek's gralloc handle carries a gralloc_shared_memory memfd of about
+4.4 KiB next to the pixel dma-buf. lseek(SEEK_END) sizes a memfd too, so
+for any buffer of a page or less the memfd was the largest fd and went
+to the compositor, which can't import it: Firefox's first 1x1 window was
+a protocol error that took Firefox down. Skip fds that aren't on the
+dma-buf filesystem.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/platforms/wayland/wayland_window_common.cpp | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/hybris/platforms/wayland/wayland_window_common.cpp b/hybris/platforms/wayland/wayland_window_common.cpp
+index b9ea3a8..551c9b2 100644
+--- a/hybris/platforms/wayland/wayland_window_common.cpp
++++ b/hybris/platforms/wayland/wayland_window_common.cpp
+@@ -43,6 +43,10 @@
+ #include <wayland-client.h>
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
+ #include <sys/mman.h>
++#include <sys/vfs.h>
++#ifndef DMA_BUF_MAGIC
++#define DMA_BUF_MAGIC 0x444d4142 /* linux/magic.h, not in every header set */
++#endif
+ #include <vector>
+ #endif // WANT_LINDROID_DRM
+ 
+@@ -832,9 +836,9 @@ void DrmWaylandBuffer::init(
+     /* Standard linux-dmabuf: one plane, the handle's pixel dma-buf. Lindroid's
+      * compositor took every handle fd plus a memfd describing the native_handle; KWin
+      * and other stock compositors reject that as an unknown multi-plane buffer.
+-     * MediaTek gralloc also carries a gralloc_extra fd (no size) and a small metadata
+-     * dma-buf, which beats a "big enough" test on tiny buffers such as vkcube's first
+-     * 1x1 one. Only dma-bufs answer lseek(SEEK_END), and the pixels are the largest. */
++     * MediaTek gralloc also carries a gralloc_extra fd and a gralloc_shared_memory memfd
++     * of about 4.4 KiB, which outsizes the pixels of any buffer up to a page (Firefox's
++     * first 1x1 window). So only dma-bufs count, and the pixels are the largest. */
+     int bpp;
+     uint32_t req_format = hal_to_drm_format(format, &bpp);
+     if (hybris_wayland_swap_rb && req_format == GBM_FORMAT_ABGR8888)
+@@ -844,6 +848,9 @@ void DrmWaylandBuffer::init(
+     int pixel_fd = -1;
+     off_t best = 0;
+     for (int i = 0; i < nh->numFds; i++) {
++        struct statfs fs;
++        if (fstatfs(nh->data[i], &fs) || fs.f_type != DMA_BUF_MAGIC)
++            continue;
+         off_t size = lseek(nh->data[i], 0, SEEK_END);
+         if (size > best) {
+             best = size;
+-- 
+2.55.0
+

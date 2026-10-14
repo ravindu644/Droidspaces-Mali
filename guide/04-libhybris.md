@@ -2,7 +2,7 @@
 
 The Mali driver is an Android library, built against bionic, Android's C library. The container runs glibc. libhybris loads bionic libraries into a glibc process and connects the two.
 
-We build Droidian's `feature/next/lindroid-drm` branch, which already has a TLS patcher and a dma-buf Wayland path, plus the 22 patches in `patches/libhybris/`. They are also the [`feature/mali-desktop`](https://github.com/ravindu644/libhybris/tree/feature/mali-desktop) branch of our fork.
+We build Droidian's `feature/next/lindroid-drm` branch, which already has a TLS patcher and a dma-buf Wayland path, plus the 23 patches in `patches/libhybris/`. They are also the [`feature/mali-desktop`](https://github.com/ravindu644/libhybris/tree/feature/mali-desktop) branch of our fork.
 
 Run everything in this part inside the container, as root, except the shim in step 4. The rest of the guide expects this repository at `~/Droidspaces-Mali` in the container.
 

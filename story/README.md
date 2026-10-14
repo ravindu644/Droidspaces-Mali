@@ -14,6 +14,7 @@ It all happened on one Samsung Galaxy A16 5G (SM-A166P, MediaTek MT6835, Mali-G5
 8. [A real render node](08-a-real-render-node.md): vgem
 9. [X11](09-x11.md): Xwayland and old OpenGL games on the Mali
 10. [Daily driving](10-daily-driving.md): autostart, audio, the lock screen and an idle desktop that never idled
+11. [Fedora 44](11-fedora.md): a CI-built rootfs, what it took, and why browsers sent us back to Debian
 
 ## Lessons that apply everywhere
 
@@ -23,6 +24,8 @@ It all happened on one Samsung Galaxy A16 5G (SM-A166P, MediaTek MT6835, Mali-G5
 - **A bionic library under glibc fails far from the cause.** A crash inside the driver was a pthread key, a crash in `sscanf` was a TLS slot. Read the faulting instruction and the registers, then work backwards.
 - **One change at a time under enforcing SELinux.** Some denials are `dontaudit` and never reach a log, so the only way to find a missing rule is to add or remove rules one at a time and test.
 - **Freezing processes with `SIGSTOP` to find a render loop misleads**, when more than one loop can keep the frames coming on its own.
+- **A silent fallback is the worst failure.** Mesa can drop to llvmpipe without a word. Check the renderer after every change to the stack.
+- **"It survived" is not "it works".** A crash test can pass because the feature under test never started. Read the log before believing a pass.
 
 ## Still open
 
@@ -31,3 +34,4 @@ It all happened on one Samsung Galaxy A16 5G (SM-A166P, MediaTek MT6835, Mali-G5
 - AFBC buffers instead of linear ones.
 - Instance divisors above 1.
 - The 300 ms pause before KWin's Overview opens.
+- Newer distributions, see [Fedora 44](11-fedora.md#conclusion): `nullDescriptor` emulation for current Zink, the driver bug KWin 6.7's Qt Quick scenes trigger, and Zink's gradients and clip masks in browsers.
