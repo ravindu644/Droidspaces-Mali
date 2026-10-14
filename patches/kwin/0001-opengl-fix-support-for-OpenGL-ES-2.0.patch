@@ -1,0 +1,68 @@
+From 16eb4f7f161a4273924e22b03aac55b8fbd6fdb4 Mon Sep 17 00:00:00 2001
+From: Xaver Hugl <xaver.hugl@kde.org>
+Date: Tue, 30 Jun 2026 12:39:26 +0200
+Subject: [PATCH 1/2] opengl: fix support for OpenGL ES 2.0
+
+There were multiple problems with it. In GLES 2,
+- texture3d isn't a thing, the "texture" function works for 3D textures
+- you can't specify a default precision for samplers
+- derivative functions require an optional extension to be enabled
+---
+ src/opengl/base.frag    |  4 ----
+ src/opengl/glshader.cpp | 17 ++++++++++++-----
+ 2 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/src/opengl/base.frag b/src/opengl/base.frag
+index fc2274e..78d21f6 100644
+--- a/src/opengl/base.frag
++++ b/src/opengl/base.frag
+@@ -1,9 +1,5 @@
+ #version 140
+ 
+-#if GL_OES_standard_derivatives && TRAIT_ROUNDED_CORNERS && TRAIT_BORDER
+-#extension GL_OES_standard_derivatives : enable
+-#endif
+-
+ #if TRAIT_MAP_TEXTURE || TRAIT_MAP_MULTI_PLANE_TEXTURE
+ uniform sampler2D sampler;
+ in vec2 texcoord0;
+diff --git a/src/opengl/glshader.cpp b/src/opengl/glshader.cpp
+index 388e702..a1f7aad 100644
+--- a/src/opengl/glshader.cpp
++++ b/src/opengl/glshader.cpp
+@@ -93,10 +93,20 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
+                 ret.append("#version 140\n");
+             }
+         }
++        if (context->isOpenGLES() && !coreShader) {
++            ret.append("#extension GL_OES_standard_derivatives : enable\n");
++        }
+         if (context->isOpenGLES()) {
+             ret.append("precision highp float;\n");
+-            ret.append("precision highp sampler2D;\n");
+-            ret.append("precision highp sampler3D;\n");
++            if (coreShader) {
++                ret.append("precision highp sampler2D;\n");
++                ret.append("precision highp sampler3D;\n");
++            } else {
++                // in OpenGL ES 2.0, it's not possible to specify
++                // default precision for samplers
++                ret.append("#define sampler2D highp sampler2D\n");
++                ret.append("#define sampler3D highp sampler3D\n");
++            }
+         }
+         if (!coreShader) {
+             // without a version statement, OpenGL assumes GLSL 1.10,
+@@ -104,9 +114,6 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
+             ret.append("vec4 texture(in sampler2D sampler, in vec2 coordinates) {\n");
+             ret.append("    return texture2D(sampler, coordinates);\n");
+             ret.append("}\n");
+-            ret.append("vec4 texture(in sampler3D sampler, in vec3 coordinates) {\n");
+-            ret.append("    return texture3D(sampler, coordinates);\n");
+-            ret.append("}\n");
+         }
+     }
+ 
+-- 
+2.55.0
+

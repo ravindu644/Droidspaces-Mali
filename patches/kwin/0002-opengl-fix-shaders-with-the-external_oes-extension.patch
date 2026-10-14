@@ -1,0 +1,173 @@
+From caa28628c79a8525c4d86b83f2128d1029607d9a Mon Sep 17 00:00:00 2001
+From: Xaver Hugl <xaver.hugl@kde.org>
+Date: Wed, 14 Oct 2026 14:03:20 +0530
+Subject: [PATCH 2/2] opengl: fix shaders with the external_oes extension
+
+The extension has to be enabled before any non-preprocessor code in the shader.
+To keep both shaders and the preprocessor as simple as possible, just require
+the extension in all shaders.
+
+Backport of upstream bf74abc6 to KWin 6.7.5.
+---
+ ...75def7ee210b4920fceb90b379160eb38593.patch | 68 +++++++++++++++++++
+ ...abc685eb4a2c8654b33f7b24690e9d214f05.patch | 45 ++++++++++++
+ src/opengl/base.frag                          |  1 -
+ src/opengl/glshader.cpp                       |  3 +
+ 4 files changed, 116 insertions(+), 1 deletion(-)
+ create mode 100644 21f875def7ee210b4920fceb90b379160eb38593.patch
+ create mode 100644 bf74abc685eb4a2c8654b33f7b24690e9d214f05.patch
+
+diff --git a/21f875def7ee210b4920fceb90b379160eb38593.patch b/21f875def7ee210b4920fceb90b379160eb38593.patch
+new file mode 100644
+index 0000000..712ad3f
+--- /dev/null
++++ b/21f875def7ee210b4920fceb90b379160eb38593.patch
+@@ -0,0 +1,68 @@
++From 21f875def7ee210b4920fceb90b379160eb38593 Mon Sep 17 00:00:00 2001
++From: Xaver Hugl <xaver.hugl@kde.org>
++Date: Tue, 30 Jun 2026 12:39:26 +0200
++Subject: [PATCH] opengl: fix support for OpenGL ES 2.0
++
++There were multiple problems with it. In GLES 2,
++- texture3d isn't a thing, the "texture" function works for 3D textures
++- you can't specify a default precision for samplers
++- derivative functions require an optional extension to be enabled
++---
++ src/opengl/base.frag    |  4 ----
++ src/opengl/glshader.cpp | 17 ++++++++++++-----
++ 2 files changed, 12 insertions(+), 9 deletions(-)
++
++diff --git a/src/opengl/base.frag b/src/opengl/base.frag
++index fc2274ec4f1..78d21f6cb06 100644
++--- a/src/opengl/base.frag
+++++ b/src/opengl/base.frag
++@@ -1,9 +1,5 @@
++ #version 140
++ 
++-#if GL_OES_standard_derivatives && TRAIT_ROUNDED_CORNERS && TRAIT_BORDER
++-#extension GL_OES_standard_derivatives : enable
++-#endif
++-
++ #if TRAIT_MAP_TEXTURE || TRAIT_MAP_MULTI_PLANE_TEXTURE
++ uniform sampler2D sampler;
++ in vec2 texcoord0;
++diff --git a/src/opengl/glshader.cpp b/src/opengl/glshader.cpp
++index 388e7026e73..a1f7aad1398 100644
++--- a/src/opengl/glshader.cpp
+++++ b/src/opengl/glshader.cpp
++@@ -93,10 +93,20 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
++                 ret.append("#version 140\n");
++             }
++         }
+++        if (context->isOpenGLES() && !coreShader) {
+++            ret.append("#extension GL_OES_standard_derivatives : enable\n");
+++        }
++         if (context->isOpenGLES()) {
++             ret.append("precision highp float;\n");
++-            ret.append("precision highp sampler2D;\n");
++-            ret.append("precision highp sampler3D;\n");
+++            if (coreShader) {
+++                ret.append("precision highp sampler2D;\n");
+++                ret.append("precision highp sampler3D;\n");
+++            } else {
+++                // in OpenGL ES 2.0, it's not possible to specify
+++                // default precision for samplers
+++                ret.append("#define sampler2D highp sampler2D\n");
+++                ret.append("#define sampler3D highp sampler3D\n");
+++            }
++         }
++         if (!coreShader) {
++             // without a version statement, OpenGL assumes GLSL 1.10,
++@@ -104,9 +114,6 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
++             ret.append("vec4 texture(in sampler2D sampler, in vec2 coordinates) {\n");
++             ret.append("    return texture2D(sampler, coordinates);\n");
++             ret.append("}\n");
++-            ret.append("vec4 texture(in sampler3D sampler, in vec3 coordinates) {\n");
++-            ret.append("    return texture3D(sampler, coordinates);\n");
++-            ret.append("}\n");
++         }
++     }
++ 
++-- 
++GitLab
++
+diff --git a/bf74abc685eb4a2c8654b33f7b24690e9d214f05.patch b/bf74abc685eb4a2c8654b33f7b24690e9d214f05.patch
+new file mode 100644
+index 0000000..59eaca7
+--- /dev/null
++++ b/bf74abc685eb4a2c8654b33f7b24690e9d214f05.patch
+@@ -0,0 +1,45 @@
++From bf74abc685eb4a2c8654b33f7b24690e9d214f05 Mon Sep 17 00:00:00 2001
++From: Xaver Hugl <xaver.hugl@kde.org>
++Date: Thu, 30 Jul 2026 17:11:04 +0200
++Subject: [PATCH] opengl: fix shaders with the external_oes extension
++
++The extension has to be enabled before any non-preprocessor code in the shader.
++To keep both shaders and the preprocessor as simple as possible, just require
++the extension in all shaders.
++---
++ src/opengl/base.frag    | 1 -
++ src/opengl/glshader.cpp | 2 ++
++ 2 files changed, 2 insertions(+), 1 deletion(-)
++
++diff --git a/src/opengl/base.frag b/src/opengl/base.frag
++index 78d21f6cb06..afd4bdc105c 100644
++--- a/src/opengl/base.frag
+++++ b/src/opengl/base.frag
++@@ -10,7 +10,6 @@ uniform sampler2D sampler1;
++ #endif
++ 
++ #if TRAIT_MAP_EXTERNAL_TEXTURE
++-#extension GL_OES_EGL_image_external : require
++ uniform samplerExternalOES sampler;
++ in vec2 texcoord0;
++ #endif
++diff --git a/src/opengl/glshader.cpp b/src/opengl/glshader.cpp
++index 399902cb0b8..96355d538d1 100644
++--- a/src/opengl/glshader.cpp
+++++ b/src/opengl/glshader.cpp
++@@ -85,10 +85,12 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
++     if (recursionDepth == 1) {
++         if (coreShader) {
++             ret.append("#version 300 es\n");
+++            ret.append("#extension GL_OES_EGL_image_external : require\n");
++             ret.append("precision highp float;\n");
++             ret.append("precision highp sampler2D;\n");
++             ret.append("precision highp sampler3D;\n");
++         } else {
+++            ret.append("#extension GL_OES_EGL_image_external : require\n");
++             // derivative functions are optional in 2.0
++             ret.append("#extension GL_OES_standard_derivatives : enable\n");
++             ret.append("precision highp float;\n");
++-- 
++GitLab
++
+diff --git a/src/opengl/base.frag b/src/opengl/base.frag
+index 78d21f6..afd4bdc 100644
+--- a/src/opengl/base.frag
++++ b/src/opengl/base.frag
+@@ -10,7 +10,6 @@ uniform sampler2D sampler1;
+ #endif
+ 
+ #if TRAIT_MAP_EXTERNAL_TEXTURE
+-#extension GL_OES_EGL_image_external : require
+ uniform samplerExternalOES sampler;
+ in vec2 texcoord0;
+ #endif
+diff --git a/src/opengl/glshader.cpp b/src/opengl/glshader.cpp
+index a1f7aad..a1e1dbc 100644
+--- a/src/opengl/glshader.cpp
++++ b/src/opengl/glshader.cpp
+@@ -93,6 +93,9 @@ std::optional<QByteArray> GLShader::preprocess(const QByteArray &src, GLenum sha
+                 ret.append("#version 140\n");
+             }
+         }
++        if (context->isOpenGLES()) {
++            ret.append("#extension GL_OES_EGL_image_external : require\n");
++        }
+         if (context->isOpenGLES() && !coreShader) {
+             ret.append("#extension GL_OES_standard_derivatives : enable\n");
+         }
+-- 
+2.55.0
+

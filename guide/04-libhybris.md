@@ -2,7 +2,7 @@
 
 The Mali driver is an Android library, built against bionic, Android's C library. The container runs glibc. libhybris loads bionic libraries into a glibc process and connects the two.
 
-We build Droidian's `feature/next/lindroid-drm` branch, which already has a TLS patcher and a dma-buf Wayland path, plus the 22 patches in `patches/libhybris/`. They are also the [`feature/mali-desktop`](https://github.com/ravindu644/libhybris/tree/feature/mali-desktop) branch of our fork.
+We build Droidian's `feature/next/lindroid-drm` branch, which already has a TLS patcher and a dma-buf Wayland path, plus the 24 patches in `patches/libhybris/`. They are also the [`feature/mali-desktop`](https://github.com/ravindu644/libhybris/tree/feature/mali-desktop) branch of our fork.
 
 Run everything in this part inside the container, as root, except the shim in step 4. The rest of the guide expects this repository at `~/Droidspaces-Mali` in the container.
 
@@ -52,7 +52,7 @@ make -k install
 - Setting `CFLAGS` replaces configure's own, so `-DDEBUG` is added back by hand. Without it, libhybris can't log anything, even with `HYBRIS_LOGGING_LEVEL=debug`.
 - After changing `CFLAGS`, run `make clean`. make doesn't notice flag changes.
 
-## Step 3: A Vulkan-only library directory
+## Step 3: Library directories for apps and KWin
 
 KWin uses libhybris' EGL. Apps must keep Mesa's EGL and only take Vulkan and OpenCL from libhybris. They get a directory with just those:
 
@@ -62,6 +62,15 @@ for l in libvulkan.so.1 libOpenCL.so.1 libhybris-common.so.1 libhardware.so.2 li
     ln -sf /opt/hy/inst/lib/$l .
 done
 ln -sf libvulkan.so.1 libvulkan.so && ln -sf libOpenCL.so.1 libOpenCL.so
+```
+
+KWin gets the opposite, hybris' EGL and GLES without its Vulkan. Newer KWin links Vulkan itself, and hybris' Vulkan crashes it:
+
+```bash
+mkdir -p /opt/hy/egl && cd /opt/hy/egl
+for l in libEGL.so.1 libGLESv2.so.2 libGLESv1_CM.so.1; do
+    ln -sf /opt/hy/inst/lib/$l .
+done
 ```
 
 ## Step 4: The gralloc shim

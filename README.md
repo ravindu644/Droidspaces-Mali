@@ -35,9 +35,25 @@ X11 app      ->  Xwayland   ->  Mesa Zink  ->  hybris Vulkan
 
 KWin uses the Mali's EGL directly. Every app goes through Mesa Zink on the Mali's Vulkan driver. Buffers travel between them as dma-bufs.
 
+## The quick way: Fedora 44
+
+The `Fedora 44 - KDE Plasma on the Mali GPU` rootfs in the Droidspaces app has all of this
+built in. Do parts 2 and 3 of the guide (the kernel fixes, the SELinux rule and the Anland
+app), install the rootfs, then turn on **Anland Display** in the container's settings and
+start it. The installer sets GPU access and the Android partition binds by itself. The
+desktop user is `fedora`, password `1234`.
+
+Its packages are built here by CI and published as the
+[`fedora-44`](https://github.com/ravindu644/Droidspaces-Mali/releases/tag/fedora-44) release:
+Fedora's own KWin with Anland's backend and `patches/kwin/`, `droidspaces-mali` with
+libhybris, the gralloc shim and the session, and `droidspaces-mali-mesa`, Mesa 25.1 with
+`patches/mesa-25.1/` for apps. Zink in Mesa 25.2 and later requires `nullDescriptor` from
+`VK_EXT_robustness2`, which the Mali lacks, so apps keep their own Mesa under `/opt/hy/mesa`
+and Fedora's stays as it ships.
+
 ## Guide
 
-Follow the parts in order.
+The guide builds everything by hand on Debian 13. Follow the parts in order.
 
 1. [Before you start](guide/01-before-you-start.md): what you need, and what to change on another phone
 2. [Kernel](guide/02-kernel.md): two kernel fixes and how to load them
@@ -58,11 +74,14 @@ Follow the parts in order.
 | Path | What |
 |---|---|
 | `patches/kernel/` | Mali kernel driver fix for PID namespaces, vgem as a vendor module |
-| `patches/libhybris/` | 22 patches on Droidian's `feature/next/lindroid-drm` |
+| `patches/libhybris/` | 24 patches on Droidian's `feature/next/lindroid-drm` |
 | `patches/mesa/` | 5 patches on Debian's Mesa 25.0.7 |
+| `patches/mesa-25.1/` | the 3 of them Mesa 25.1.9 still needs, plus an upstream fix to build with glibc 2.43 |
+| `patches/kwin/` | 2 upstream KWin 6.8 shader fixes for KWin 6.7, whose shaders the Mali compiler rejects |
 | `patches/anland/` | 3 patches on Anland's `legacy` branch |
 | `shim/` | the gralloc shim on `AHardwareBuffer`, and the header libhybris needs with Android 14 headers |
 | `session/` | the systemd unit, environment, KWin wrapper and its preload |
+| `packages/fedora/` | the RPM spec and build script behind the `fedora-44` release |
 
 Each patch series is also a branch on a fork, if you prefer `git clone` to `git am`:
 
@@ -79,11 +98,14 @@ Each patch series is also a branch on a fork, if you prefer `git clone` to `git 
 - **KWin runs without realtime scheduling.** See [Session](guide/07-session.md).
 - **The Overview effect pauses about 300 ms before it opens.** That's KWin building its QML scene on the phone CPU. Upstream reports the same on slow CPUs.
 - **Instance divisors above 1** are treated as 1.
+- **Firefox's PBO texture uploads come out empty through Zink**, so text and icons were white boxes. The Fedora package turns them off with `gfx.webrender.pbo-uploads=false`. On Debian, set it in `about:config`.
+- **Fedora: Overview and Present Windows render on the CPU, with empty window previews.** KWin 6.7's Qt Quick scenes crash the Mali driver on their first texture upload when they render on the GPU.
 
 ## Credits
 
 - [libhybris](https://github.com/libhybris/libhybris) and [Droidian's fork](https://github.com/droidian/libhybris), whose `lindroid-drm` branch carries the TLS patcher and the dma-buf Wayland path this builds on
 - [Halium android-headers](https://github.com/Halium/android-headers)
 - [Anland](https://github.com/SuperTurtleDev/anland)
+- [droidspaces-package](https://github.com/Goldzxcbug/droidspaces-package), whose Fedora KWin builds showed the way
 - [bionic-vulkan-wrapper](https://github.com/leegao/bionic-vulkan-wrapper), for the dma-heap import idea behind the export emulation
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)

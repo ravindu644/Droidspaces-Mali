@@ -20,7 +20,7 @@ extern char **environ;
 
 /* KWin's own settings that a client must not inherit. */
 static const char *const kwin_only[] = { "LIBEGL=", "LIBGLESV2=", "KWIN_COMPOSE=",
-                                         "ANLAND_DRM_DEVICE=", NULL };
+                                         "ANLAND_DRM_DEVICE=", "QT_QUICK_BACKEND=", NULL };
 
 static char *client[MAX_VARS];
 static int nclient;

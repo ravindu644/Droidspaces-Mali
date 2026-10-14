@@ -1,0 +1,53 @@
+From d0204a505c69a15d2568542b43f8ffa3b65e7188 Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 00:46:03 +0530
+Subject: [PATCH 2/3] zink: don't split fragment inputs by component on gaps
+
+A fragment input read as .xy and .w became two SPIR-V variables at one
+location, the second decorated Component 3. The Mali proprietary compiler
+reads such inputs wrongly: fixed-function texturing (texture2DProj, which
+needs .w) sampled at garbage coordinates, so old GL apps showed wrong,
+unfiltered and wrong-mip textures. Fill the gap with one wider vector when
+the components are interpolated floats of the same size.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ src/gallium/drivers/zink/zink_compiler.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_compiler.c b/src/gallium/drivers/zink/zink_compiler.c
+index 1d751d5..8cad474 100644
+--- a/src/gallium/drivers/zink/zink_compiler.c
++++ b/src/gallium/drivers/zink/zink_compiler.c
+@@ -5256,8 +5256,26 @@ update_io_var_state(nir_intrinsic_instr *intr, struct rework_io_state *ris)
+     */
+    if (ris->component_mask &&
+        (!(ris->component_mask & cmask) || ris->fb_fetch_output != sem.fb_fetch_output || ris->dual_source_blend_index != sem.dual_source_blend_index)) {
+-      ris->ignored_component_mask |= cmask;
+-      return;
++      /* A fragment input read as .xy and .w would become two variables at one location,
++       * the second with a Component decoration. The Mali proprietary compiler reads such a
++       * split input wrongly (fixed-function texture2DProj's .w, so textures sample at the
++       * wrong coordinates). Interpolated float components of one size fill the gap instead:
++       * reading a wider vector is valid everywhere. */
++      bool merge = ris->stage == MESA_SHADER_FRAGMENT && ris->mode == nir_var_shader_in &&
++                   is_load && is_interp && !(ris->component_mask & cmask) &&
++                   ris->fb_fetch_output == sem.fb_fetch_output &&
++                   ris->dual_source_blend_index == sem.dual_source_blend_index &&
++                   ris->arrayed_io == io_instr_is_arrayed(intr) &&
++                   ris->bit_size == intr->def.bit_size &&
++                   nir_alu_type_get_base_type(ris->type) == nir_type_float &&
++                   nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) == nir_type_float;
++      if (!merge) {
++         ris->ignored_component_mask |= cmask;
++         return;
++      }
++      cmask = BITFIELD_RANGE(MIN2(ffs(ris->component_mask), ffs(cmask)) - 1,
++                             MAX2(util_last_bit(ris->component_mask), util_last_bit(cmask)) -
++                             (MIN2(ffs(ris->component_mask), ffs(cmask)) - 1));
+    }
+ 
+    assert(!ris->indirect_only || sem.num_slots > 1);
+-- 
+2.55.0
+

@@ -1,0 +1,50 @@
+From 0d2583bd78694f02e862c9fc73b31f108eac317f Mon Sep 17 00:00:00 2001
+From: ravindu644 <droidcasts@protonmail.com>
+Date: Wed, 14 Oct 2026 13:55:31 +0530
+Subject: [PATCH] hybris: egl: offer the GBM platform without Lindroid's evdi
+ card
+
+KWin 6.7 opens its EGL display on a GBM device even in backends that
+only render offscreen, such as Anland's, and refuses an EGL without
+EGL_KHR_platform_gbm. hybris sent the GBM platform to the lindroid-drm
+window system, which needs Lindroid's evdi card. Without that card,
+treat GBM like surfaceless and advertise the GBM client extensions.
+
+Signed-off-by: ravindu644 <droidcasts@protonmail.com>
+---
+ hybris/egl/egl.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/hybris/egl/egl.c b/hybris/egl/egl.c
+index 2f70556..df86b00 100644
+--- a/hybris/egl/egl.c
++++ b/hybris/egl/egl.c
+@@ -326,7 +326,14 @@ EGLDisplay __eglHybrisGetPlatformDisplayCommon(EGLenum platform,
+ 			break;
+ #endif
+ 		case EGL_PLATFORM_GBM_KHR:
+-			hybris_ws = "lindroid-drm";
++			/* KWin 6.7 always opens its EGL display on a GBM device, even when it only
++			 * renders offscreen. Without Lindroid's evdi card there is nothing to scan
++			 * out to, so treat it like surfaceless. */
++			if (access("/dev/dri/by-path/platform-evdi-lindroid.0-card", F_OK) == 0) {
++				hybris_ws = "lindroid-drm";
++			} else {
++				hybris_ws = "null";
++			}
+ 			break;
+ 
+ 		case EGL_PLATFORM_X11_KHR:
+@@ -435,7 +442,8 @@ const char * eglQueryString(EGLDisplay dpy, EGLint name)
+ 		const char *ret = _eglQueryString(dpy, name);
+ 		static char eglextensionsbuf[2048];
+ 		snprintf(eglextensionsbuf, 2046, "%s %s", ret,
+-			"EGL_EXT_client_extensions EGL_EXT_platform_wayland EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless"
++			"EGL_EXT_client_extensions EGL_EXT_platform_wayland EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless "
++			"EGL_KHR_platform_gbm EGL_MESA_platform_gbm"
+ 		);
+ 		ret = eglextensionsbuf;
+ 		return ret;
+-- 
+2.55.0
+

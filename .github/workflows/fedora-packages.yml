@@ -1,0 +1,79 @@
+name: Fedora packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, fedora-packages]
+    paths: [patches/**, packages/fedora/**, session/**, shim/**]
+
+jobs:
+  shim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libui_compat_layer.so with the NDK
+        run: |
+          $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang \
+            -shared -fPIC -O2 -o libui_compat_layer.so shim/ui_compat_ahb.c -lnativewindow -llog
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim
+          path: libui_compat_layer.so
+
+  hybris:
+    needs: shim
+    runs-on: ubuntu-24.04-arm
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: shim
+          path: shim
+      - run: packages/fedora/build.sh hybris
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-hybris
+          path: ~/rpmbuild/RPMS/*/*.rpm
+
+  mesa:
+    runs-on: ubuntu-24.04-arm
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      - run: packages/fedora/build.sh mesa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-mesa
+          path: ~/rpmbuild/RPMS/*/*.rpm
+
+  kwin:
+    runs-on: ubuntu-24.04-arm
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      - run: packages/fedora/build.sh kwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-kwin
+          path: ~/rpmbuild/RPMS/*/*.rpm
+
+  release:
+    needs: [hybris, mesa, kwin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpms-*
+          merge-multiple: true
+          path: rpms
+      # One rolling release per Fedora version, replaced on every build
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete fedora-44 --cleanup-tag -y || true
+          gh release create fedora-44 --title "Fedora 44 packages" \
+            --notes "Built from ${GITHUB_SHA}. Install with: dnf install ./*.rpm" $(find rpms -name "*.rpm")
